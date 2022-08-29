@@ -10,6 +10,7 @@ from scipy.ndimage.morphology import (
 )
 
 from skimage.segmentation import watershed
+
 from misc.utils import get_bounding_box, remove_small_objects
 
 import warnings

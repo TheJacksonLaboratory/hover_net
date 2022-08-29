@@ -124,7 +124,8 @@ class TrainManager(Config):
         dataloader = DataLoader(
             input_dataset,
             num_workers=nr_procs,
-            batch_size=batch_size * self.nr_gpus,
+            # batch_size=batch_size * self.nr_gpus,
+            batch_size=batch_size,
             shuffle=run_mode == "train",
             drop_last=run_mode == "train",
             worker_init_fn=worker_init_fn,
@@ -216,7 +217,8 @@ class TrainManager(Config):
 
             # * extremely slow to pass this on DGX with 1 GPU, why (?)
             net_desc = DataParallel(net_desc)
-            net_desc = net_desc.to("cuda")
+            if torch.cuda.is_available():
+                net_desc = net_desc.to("cuda")
             # print(net_desc) # * dump network definition or not?
             optimizer, optimizer_args = net_info["optimizer"]
             optimizer = optimizer(net_desc.parameters(), **optimizer_args)

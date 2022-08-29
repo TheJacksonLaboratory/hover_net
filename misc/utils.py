@@ -8,7 +8,6 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
-
 ####
 def normalize(mask, dtype=np.uint8):
     return (255 * mask / np.amax(mask)).astype(dtype)
@@ -56,7 +55,7 @@ def cropping_center(x, crop_shape, batch=False):
 def rm_n_mkdir(dir_path):
     """Remove and make directory."""
     if os.path.isdir(dir_path):
-        shutil.rmtree(dir_path)
+        shutil.rmtree(dir_path, True)
     os.makedirs(dir_path)
 
 

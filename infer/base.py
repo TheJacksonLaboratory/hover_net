@@ -56,8 +56,18 @@ class InferManager(object):
     def __load_model(self):
         """Create the model, load the checkpoint and define
         associated run steps to process each data batch.
-        
+
         """
+        model_desc = import_module("models._autoencoders")
+        synthesizer_class = getattr(model_desc, "Synthesizer")
+        if self.method["rec_model_path"] is not None:
+            saved_state_dict = torch.load(self.method["rec_model_path"], map_location='cpu')
+            rec_model = synthesizer_class(**saved_state_dict["args"])
+            rec_model.load_state_dict(saved_state_dict["decoder"])
+            rec_model = torch.nn.DataParallel(rec_model)
+            rec_model.eval()
+            self.method["model_args"]["rec_model"] = rec_model
+
         model_desc = import_module("models.hovernet.net_desc")
         model_creator = getattr(model_desc, "create_model")
 
@@ -67,7 +77,8 @@ class InferManager(object):
 
         net.load_state_dict(saved_state_dict, strict=True)
         net = torch.nn.DataParallel(net)
-        net = net.to("cuda")
+        if torch.cuda.is_available():
+            net = net.to("cuda")
 
         module_lib = import_module("models.hovernet.run_desc")
         run_step = getattr(module_lib, "infer_step")

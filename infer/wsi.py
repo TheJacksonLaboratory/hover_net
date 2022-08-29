@@ -1,3 +1,4 @@
+from bz2 import compress
 import multiprocessing as mp
 from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, as_completed, wait
 from multiprocessing import Lock, Pool
@@ -20,12 +21,16 @@ from importlib import import_module
 
 import cv2
 import numpy as np
+import zarr
+from numcodecs import Blosc
 import psutil
 import scipy.io as sio
 import torch
 import torch.utils.data as data
+from torchvision import transforms
 import tqdm
 from dataloader.infer_loader import SerializeArray, SerializeFileList
+from dataloader import ZarrDataset, LabeledZarrDataset
 from docopt import docopt
 from misc.utils import (
     cropping_center,
@@ -232,6 +237,16 @@ def _post_proc_para_wrapper(pred_map_mmap_path, tile_info, func, func_kwargs):
 
 
 ####
+def _post_proc_para_wrapper_zarr(pred_map_mmap_path, tile_info, func, func_kwargs):
+    """Wrapper for parallel post processing."""
+    idx, tile_tl, tile_br = tile_info
+    wsi_pred_map_ptr = zarr.open(pred_map_mmap_path, mode="r")
+    tile_pred_map = wsi_pred_map_ptr[0, :, 0, tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]].transpose(1, 2, 0)
+    tile_pred_map = np.array(tile_pred_map)  # from mmap to ram
+    return func(tile_pred_map, **func_kwargs), tile_info
+
+
+####
 def _assemble_and_flush(wsi_pred_map_mmap_path, chunk_info, patch_output_list):
     """Assemble the results. Write to newly created holder for this wsi"""
     wsi_pred_map_ptr = np.load(wsi_pred_map_mmap_path, mmap_mode="r+")
@@ -256,15 +271,63 @@ def _assemble_and_flush(wsi_pred_map_mmap_path, chunk_info, patch_output_list):
     return
 
 
+def _assemble_and_flush_zarr(wsi_pred_map_mmap_path, chunk_info, patch_output_list):
+    """Assemble the results. Write to newly created holder for this wsi"""
+    if patch_output_list is None:
+        # chunk_pred_map[:] = 0 # zero flush when there is no-results
+        # print(chunk_info.flatten(), 'flush 0')
+        return
+    wsi_pred_map_ptr = zarr.open(wsi_pred_map_mmap_path, mode="r+")
+
+    for pinfo in patch_output_list:
+        pcoord, pdata = pinfo
+        pdata = np.squeeze(pdata).transpose(2, 0, 1)
+        pcoord = np.squeeze(pcoord)[:2]
+        wsi_pred_map_ptr[0, :, 0,
+                         pcoord[0] + chunk_info[1][0][0] : pcoord[0] + chunk_info[1][0][0] + pdata.shape[1],
+                         pcoord[1] + chunk_info[1][0][1] : pcoord[1] + chunk_info[1][0][1] + pdata.shape[2]] = pdata
+    # print(chunk_info.flatten(), 'pass')
+    return
+
+
 ####
 class InferManager(base.InferManager):
     def __run_model(self, patch_top_left_list, pbar_desc):
         # TODO: the cost of creating dataloader may not be cheap ?
-        dataset = SerializeArray(
-            "%s/cache_chunk.npy" % self.cache_path,
-            patch_top_left_list,
-            self.patch_input_shape,
-        )
+        if (hasattr(self.wsi_handler.file_ptr, 'store')
+           and '.zarr' in self.wsi_handler.file_ptr.store.path):
+            # Check whether the input data is compressed or not.
+            if 'compressed' in self.wsi_handler.file_ptr.keys():
+                comp_metadata = self.wsi_handler.file_ptr['compressed'].attrs['compression_metadata']
+                compression_level = comp_metadata['compression_level']
+                compressed_input = True
+                data_grop = 'compressed/0/0'
+            else:
+                compression_level = 0
+                compressed_input = False
+                data_grop = '0/0'
+
+            dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
+                                  patch_size=self.patch_input_shape[0],
+                                  dataset_size=-1,
+                                  data_mode='all',
+                                  padding=None,
+                                  stride=self.patch_output_shape[0],
+                                  transform=None,
+                                  source_format='zarr',
+                                  workers=0,
+                                  data_axes='TCZYX',
+                                  data_group=data_grop,
+                                  by_rows=False,
+                                  compression_level=compression_level,
+                                  compressed_input=compressed_input
+                    )
+        else:
+            dataset = SerializeArray(
+                "%s/cache_chunk.npy" % self.cache_path,
+                patch_top_left_list,
+                self.patch_input_shape,
+            )
 
         dataloader = data.DataLoader(
             dataset,
@@ -336,7 +399,13 @@ class InferManager(base.InferManager):
         """
         # 1 dedicated thread just to write results back to disk
         proc_pool = Pool(processes=1)
-        wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
+        if (hasattr(self.wsi_handler.file_ptr, 'store')
+           and '.zarr' in self.wsi_handler.file_ptr.store.path):
+            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+            assemble_fun = _assemble_and_flush_zarr
+        else:
+            wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
+            assemble_fun = _assemble_and_flush_zarr
 
         masking = lambda x, a, b: (a <= x) & (x <= b)
         for idx in range(0, chunk_info_list.shape[0]):
@@ -363,11 +432,11 @@ class InferManager(base.InferManager):
 
             # shift the coordinare from wrt slide to wrt chunk
             chunk_patch_info_list -= chunk_info[:, 0]
-            chunk_data = self.wsi_handler.read_region(
-                chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
-            )
-            chunk_data = np.array(chunk_data)[..., :3]
-            np.save("%s/cache_chunk.npy" % self.cache_path, chunk_data)
+            # chunk_data = self.wsi_handler.read_region(
+            #     chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
+            # )
+            # chunk_data = np.array(chunk_data)[..., :3]
+            # np.save("%s/cache_chunk.npy" % self.cache_path, chunk_data)
 
             pbar_desc = "Process Chunk %d/%d" % (idx, chunk_info_list.shape[0])
             patch_output_list = self.__run_model(
@@ -375,7 +444,7 @@ class InferManager(base.InferManager):
             )
 
             proc_pool.apply_async(
-                _assemble_and_flush,
+                assemble_fun,
                 args=(wsi_pred_map_mmap_path, chunk_info, patch_output_list),
             )
         proc_pool.close()
@@ -389,7 +458,13 @@ class InferManager(base.InferManager):
             proc_pool = ProcessPoolExecutor(self.nr_post_proc_workers)
 
         future_list = []
-        wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
+        if (hasattr(self.wsi_handler.file_ptr, 'store')
+           and '.zarr' in self.wsi_handler.file_ptr.store.path):
+            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+            post_proc_wrapper_fun = _post_proc_para_wrapper_zarr
+        else:
+            wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
+            post_proc_wrapper_fun = _post_proc_para_wrapper
         for idx in list(range(tile_info_list.shape[0])):
             tile_tl = tile_info_list[idx][0]
             tile_br = tile_info_list[idx][1]
@@ -403,17 +478,18 @@ class InferManager(base.InferManager):
             # TODO: standarize protocol
             if proc_pool is not None:
                 proc_future = proc_pool.submit(
-                    _post_proc_para_wrapper,
+                    post_proc_wrapper_fun,
                     wsi_pred_map_mmap_path,
                     tile_info,
                     self.post_proc_func,
                     func_kwargs,
                 )
+
                 # ! manually poll future and call callback later as there is no guarantee
                 # ! that the callback is called from main thread
                 future_list.append(proc_future)
             else:
-                results = _post_proc_para_wrapper(
+                results = post_proc_wrapper_fun(
                     wsi_pred_map_mmap_path, tile_info, self.post_proc_func, func_kwargs
                 )
                 callback(results)
@@ -517,21 +593,33 @@ class InferManager(base.InferManager):
         out_ch = 3 if self.method["model_args"]["nr_types"] is None else 4
         self.wsi_inst_info = {}
         # TODO: option to use entire RAM if users have too much available, would be faster than mmap
-        self.wsi_inst_map = np.lib.format.open_memmap(
-            "%s/pred_inst.npy" % self.cache_path,
-            mode="w+",
-            shape=tuple(self.wsi_proc_shape),
-            dtype=np.int32,
-        )
-        # self.wsi_inst_map[:] = 0 # flush fill
+        if ((hasattr(self.wsi_handler.file_ptr, 'store')
+            and '.zarr' in self.wsi_handler.file_ptr.store.path)):
+            self.wsi_inst_map = zarr.open_array("%s/pred_inst.zarr" % self.cache_path, mode='w',
+                                                shape=tuple([1, 1, 1] + list(self.wsi_proc_shape)),
+                                                dtype=np.int32,
+                                                compressor=Blosc(clevel=5))
+            self.wsi_pred_map = zarr.open_array("%s/pred_map.zarr" % self.cache_path, mode='w',
+                                                shape=tuple([1, out_ch, 1] + list(self.wsi_proc_shape)),
+                                                dtype=np.float32,
+                                                compressor=Blosc(clevel=5))
+        else:
+            # warning, the value within this is uninitialized
+            self.wsi_inst_map = np.lib.format.open_memmap(
+                "%s/pred_inst.npy" % self.cache_path,
+                mode="w+",
+                shape=tuple(self.wsi_proc_shape),
+                dtype=np.int32,
+            )
 
-        # warning, the value within this is uninitialized
-        self.wsi_pred_map = np.lib.format.open_memmap(
-            "%s/pred_map.npy" % self.cache_path,
-            mode="w+",
-            shape=tuple(self.wsi_proc_shape) + (out_ch,),
-            dtype=np.float32,
-        )
+            self.wsi_pred_map = np.lib.format.open_memmap(
+                "%s/pred_map.npy" % self.cache_path,
+                mode="w+",
+                shape=tuple(self.wsi_proc_shape) + (out_ch,),
+                dtype=np.float32,
+            )
+            # self.wsi_inst_map[:] = 0 # flush fill
+
         # ! for debug
         # self.wsi_pred_map = np.load('%s/pred_map.npy' % self.cache_path, mmap_mode='r')
         end = time.perf_counter()
@@ -591,9 +679,14 @@ class InferManager(base.InferManager):
                 inst_info["centroid"] += top_left
                 self.wsi_inst_info[inst_id + wsi_max_id] = inst_info
             pred_inst[pred_inst > 0] += wsi_max_id
-            self.wsi_inst_map[
-                tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-            ] = pred_inst
+            if self.wsi_inst_map.ndim > 2:
+                self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
+            else:
+                self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
 
             pbar.update()  # external
             return
@@ -747,5 +840,5 @@ class InferManager(base.InferManager):
                 log_info("Finish")
             except:
                 logging.exception("Crash")
-        rm_n_mkdir(self.cache_path)  # clean up all cache
+        # rm_n_mkdir(self.cache_path)  # clean up all cache
         return
