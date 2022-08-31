@@ -204,21 +204,18 @@ class ZarrHandler(FileHandler):
     using bioformats2raw.
     """
 
-    def __init__(self, file_path):
+    def __init__(self, file_path, data_group):
         """file_path (string): path to single whole-slide image."""
         super().__init__()
         self.file_ptr = zarr.open(file_path, mode='r')  # load zarr object
         self._file_path = file_path
-        self.metadata = self.__load_metadata()
 
         # only used for cases where the read magnification is different from
         self.image_ptr = None
         self.read_level = None
+        self._data_group = data_group
 
-        if 'compressed' in self.file_ptr.keys():
-            self._data_group = 'compressed/0'
-        else:
-            self._data_group = '0'
+        self.metadata = self.__load_metadata()
 
     def __load_metadata(self):
         xml_file_name = os.path.join(self._file_path, 'OME/METADATA.ome.xml')
@@ -234,9 +231,12 @@ class ZarrHandler(FileHandler):
                                    ann.namespace == 'openmicroscopy.org/'
                                                     'PyramidResolution',
                                    ome_metadata.structured_annotations))[0]
-
-        pyr_res = [(int(res.value.split(' ')[0]), int(res.value.split(' ')[1]))
-                   for res in pyr_metadata.value.m]
+        if 'compressed' in self._data_group:
+            pyr_res = [tuple(self.file_ptr[self._data_group + '/' + res_path].shape[-2:])
+                       for res_path in sorted(self.file_ptr[self._data_group]) if res_path != '0']
+        else:
+            pyr_res = [(int(res.value.split(' ')[0]), int(res.value.split(' ')[1]))
+                       for res in pyr_metadata.value.m]
 
         magnification_level = [nom_mag] + [nom_mag / (base_shape[0] / res[0])
                                            for res in pyr_res]
@@ -332,7 +332,7 @@ class ZarrHandler(FileHandler):
         return wsi_img
 
 
-def get_file_handler(path, backend):
+def get_file_handler(path, backend, data_group=None):
     if backend in [
             '.svs', '.tif',
             '.vms', '.vmu', '.ndpi',
@@ -344,6 +344,6 @@ def get_file_handler(path, backend):
     elif backend in [
             '.zarr', '.zarr_memory',
             ]:
-        return ZarrHandler(path)
+        return ZarrHandler(path, data_group)
     else:
         assert False, "Unknown WSI format `%s`" % backend

@@ -16,7 +16,9 @@ Options:
 
   --model_path=<path>         Path to saved checkpoint.
   --rec_model_path=<path>     Path to saved reconstruction model checkpoint.
-  --model_mode=<mode>         Original HoVer-Net or the reduced version used PanNuke and MoNuSAC, 
+  --compressed_input          Is the input compressed? [default: False]
+  --data_group=<s>            Group path in the zarr file to use as source data [default: 0]
+  --model_mode=<mode>         Original HoVer-Net or the reduced version used PanNuke and MoNuSAC,
                               'original' or 'fast'. [default: fast]
   --nr_inference_workers=<n>  Number of workers during inference. [default: 8]
   --nr_post_proc_workers=<n>  Number of workers during post-processing. [default: 16]
@@ -131,6 +133,8 @@ if __name__ == '__main__':
             },
             'model_path' : args['model_path'],
             'rec_model_path' : args['rec_model_path'],
+            'compressed_input' : args['compressed_input'],
+            'data_group' : args['data_group'],
         },
         'type_info_path'  : None if args['type_info_path'] == '' \
                             else args['type_info_path'],
@@ -138,19 +142,14 @@ if __name__ == '__main__':
 
     # ***
     run_args = {
-        # 'batch_size' : int(args['batch_size']) * nr_gpus,
-        'batch_size' : int(args['batch_size']),
-
+        'batch_size' : int(args['batch_size']) * max(nr_gpus, 1),
         'nr_inference_workers' : int(args['nr_inference_workers']),
         'nr_post_proc_workers' : int(args['nr_post_proc_workers']),
     }
 
-    if args['model_mode'] == 'fast':
+    if args['model_mode'] in ['fast', 'compressed_rec']:
         run_args['patch_input_shape'] = 256
         run_args['patch_output_shape'] = 164
-    elif args['model_mode'] == 'compressed_rec':
-        run_args['patch_input_shape'] = 32
-        run_args['patch_output_shape'] = 20
     else:
         run_args['patch_input_shape'] = 270
         run_args['patch_output_shape'] = 80

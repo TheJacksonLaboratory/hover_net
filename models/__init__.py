@@ -1,0 +1,1 @@
+from ._autoencoders import Synthesizer

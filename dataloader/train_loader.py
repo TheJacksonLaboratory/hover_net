@@ -1,26 +1,27 @@
-import csv
-import glob
-import os
-import re
-
-import cv2
-import matplotlib.pyplot as plt
 import numpy as np
-import scipy.io as sio
 import torch.utils.data
 
-import imgaug as ia
 from imgaug import augmenters as iaa
-from misc.utils import cropping_center
 
-from .augs import (
-    add_to_brightness,
-    add_to_contrast,
-    add_to_hue,
-    add_to_saturation,
-    gaussian_blur,
-    median_blur,
-)
+from misc.utils import cropping_center
+from .augs import get_augmentation
+
+
+#### have to move outside because of spawn
+# * must initialize augmentor per worker, else duplicated rng generators may happen
+def worker_init_fn(worker_id):
+    # ! to make the seed chain reproducible, must use the torch random, not numpy
+    # the torch rng from main thread will regenerate a base seed, which is then
+    # copied into the dataloader each time it created (i.e start of each epoch)
+    # then dataloader with this seed will spawn worker, now we reseed the worker
+    worker_info = torch.utils.data.get_worker_info()
+    # to make it more random, simply switch torch.randint to np.randint
+    worker_seed = torch.randint(0, 2 ** 32, (1,))[0].cpu().item() + worker_id
+    # print('Loader Worker %d Uses RNG Seed: %d' % (worker_id, worker_seed))
+    # retrieve the dataset copied into this worker process
+    # then set the random seed for each augmentation
+    worker_info.dataset.setup_augmentor(worker_id, worker_seed)
+    return
 
 
 ####
@@ -35,7 +36,7 @@ class FileLoader(torch.utils.data.Dataset):
         input_shape: shape of the input [h,w] - defined in config.py
         mask_shape: shape of the output [h,w] - defined in config.py
         mode: 'train' or 'valid'
-        
+
     """
 
     # TODO: doc string
@@ -64,7 +65,7 @@ class FileLoader(torch.utils.data.Dataset):
         return
 
     def setup_augmentor(self, worker_id, seed):
-        self.augmentor = self.__get_augmentation(self.mode, seed)
+        self.augmentor = get_augmentation(self.input_shape, self.mode, seed)
         self.shape_augs = iaa.Sequential(self.augmentor[0])
         self.input_augs = iaa.Sequential(self.augmentor[1])
         self.id = self.id + worker_id
@@ -107,88 +108,3 @@ class FileLoader(torch.utils.data.Dataset):
         feed_dict.update(target_dict)
 
         return feed_dict
-
-    def __get_augmentation(self, mode, rng):
-        if mode == "train":
-            shape_augs = [
-                # * order = ``0`` -> ``cv2.INTER_NEAREST``
-                # * order = ``1`` -> ``cv2.INTER_LINEAR``
-                # * order = ``2`` -> ``cv2.INTER_CUBIC``
-                # * order = ``3`` -> ``cv2.INTER_CUBIC``
-                # * order = ``4`` -> ``cv2.INTER_CUBIC``
-                # ! for pannuke v0, no rotation or translation, just flip to avoid mirror padding
-                iaa.Affine(
-                    # scale images to 80-120% of their size, individually per axis
-                    scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
-                    # translate by -A to +A percent (per axis)
-                    translate_percent={"x": (-0.01, 0.01), "y": (-0.01, 0.01)},
-                    shear=(-5, 5),  # shear by -5 to +5 degrees
-                    rotate=(-179, 179),  # rotate by -179 to +179 degrees
-                    order=0,  # use nearest neighbour
-                    backend="cv2",  # opencv for fast processing
-                    seed=rng,
-                ),
-                # set position to 'center' for center crop
-                # else 'uniform' for random crop
-                iaa.CropToFixedSize(
-                    self.input_shape[0], self.input_shape[1], position="center"
-                ),
-                iaa.Fliplr(0.5, seed=rng),
-                iaa.Flipud(0.5, seed=rng),
-            ]
-
-            input_augs = [
-                iaa.OneOf(
-                    [
-                        iaa.Lambda(
-                            seed=rng,
-                            func_images=lambda *args: gaussian_blur(*args, max_ksize=3),
-                        ),
-                        iaa.Lambda(
-                            seed=rng,
-                            func_images=lambda *args: median_blur(*args, max_ksize=3),
-                        ),
-                        iaa.AdditiveGaussianNoise(
-                            loc=0, scale=(0.0, 0.05 * 255), per_channel=0.5
-                        ),
-                    ]
-                ),
-                iaa.Sequential(
-                    [
-                        iaa.Lambda(
-                            seed=rng,
-                            func_images=lambda *args: add_to_hue(*args, range=(-8, 8)),
-                        ),
-                        iaa.Lambda(
-                            seed=rng,
-                            func_images=lambda *args: add_to_saturation(
-                                *args, range=(-0.2, 0.2)
-                            ),
-                        ),
-                        iaa.Lambda(
-                            seed=rng,
-                            func_images=lambda *args: add_to_brightness(
-                                *args, range=(-26, 26)
-                            ),
-                        ),
-                        iaa.Lambda(
-                            seed=rng,
-                            func_images=lambda *args: add_to_contrast(
-                                *args, range=(0.75, 1.25)
-                            ),
-                        ),
-                    ],
-                    random_order=True,
-                ),
-            ]
-        elif mode == "valid":
-            shape_augs = [
-                # set position to 'center' for center crop
-                # else 'uniform' for random crop
-                iaa.CropToFixedSize(
-                    self.input_shape[0], self.input_shape[1], position="center"
-                )
-            ]
-            input_augs = []
-
-        return shape_augs, input_augs

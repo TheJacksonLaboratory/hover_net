@@ -25,12 +25,13 @@ import zarr
 from numcodecs import Blosc
 import psutil
 import scipy.io as sio
+from skimage import morphology
 import torch
 import torch.utils.data as data
 from torchvision import transforms
 import tqdm
 from dataloader.infer_loader import SerializeArray, SerializeFileList
-from dataloader import ZarrDataset, LabeledZarrDataset
+from dataloader import ZarrDataset
 from docopt import docopt
 from misc.utils import (
     cropping_center,
@@ -242,7 +243,7 @@ def _post_proc_para_wrapper_zarr(pred_map_mmap_path, tile_info, func, func_kwarg
     idx, tile_tl, tile_br = tile_info
     wsi_pred_map_ptr = zarr.open(pred_map_mmap_path, mode="r")
     tile_pred_map = wsi_pred_map_ptr[0, :, 0, tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]].transpose(1, 2, 0)
-    tile_pred_map = np.array(tile_pred_map)  # from mmap to ram
+
     return func(tile_pred_map, **func_kwargs), tile_info
 
 
@@ -283,6 +284,9 @@ def _assemble_and_flush_zarr(wsi_pred_map_mmap_path, chunk_info, patch_output_li
         pcoord, pdata = pinfo
         pdata = np.squeeze(pdata).transpose(2, 0, 1)
         pcoord = np.squeeze(pcoord)[:2]
+        if pcoord[0] + chunk_info[1][0][0] + pdata.shape[1] > wsi_pred_map_ptr.shape[-2] \
+           or pcoord[1] + chunk_info[1][0][1] + pdata.shape[2] > wsi_pred_map_ptr.shape[-1]:
+           continue
         wsi_pred_map_ptr[0, :, 0,
                          pcoord[0] + chunk_info[1][0][0] : pcoord[0] + chunk_info[1][0][0] + pdata.shape[1],
                          pcoord[1] + chunk_info[1][0][1] : pcoord[1] + chunk_info[1][0][1] + pdata.shape[2]] = pdata
@@ -297,15 +301,11 @@ class InferManager(base.InferManager):
         if (hasattr(self.wsi_handler.file_ptr, 'store')
            and '.zarr' in self.wsi_handler.file_ptr.store.path):
             # Check whether the input data is compressed or not.
-            if 'compressed' in self.wsi_handler.file_ptr.keys():
+            if self.method['compressed_input']:
                 comp_metadata = self.wsi_handler.file_ptr['compressed'].attrs['compression_metadata']
                 compression_level = comp_metadata['compression_level']
-                compressed_input = True
-                data_grop = 'compressed/0/0'
             else:
                 compression_level = 0
-                compressed_input = False
-                data_grop = '0/0'
 
             dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
                                   patch_size=self.patch_input_shape[0],
@@ -317,10 +317,10 @@ class InferManager(base.InferManager):
                                   source_format='zarr',
                                   workers=0,
                                   data_axes='TCZYX',
-                                  data_group=data_grop,
+                                  data_group=self.method['data_group'] + '/0',
                                   by_rows=False,
                                   compression_level=compression_level,
-                                  compressed_input=compressed_input
+                                  compressed_input=self.method['compressed_input']
                     )
         else:
             dataset = SerializeArray(
@@ -405,7 +405,7 @@ class InferManager(base.InferManager):
             assemble_fun = _assemble_and_flush_zarr
         else:
             wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
-            assemble_fun = _assemble_and_flush_zarr
+            assemble_fun = _assemble_and_flush
 
         masking = lambda x, a, b: (a <= x) & (x <= b)
         for idx in range(0, chunk_info_list.shape[0]):
@@ -432,11 +432,13 @@ class InferManager(base.InferManager):
 
             # shift the coordinare from wrt slide to wrt chunk
             chunk_patch_info_list -= chunk_info[:, 0]
-            # chunk_data = self.wsi_handler.read_region(
-            #     chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
-            # )
-            # chunk_data = np.array(chunk_data)[..., :3]
-            # np.save("%s/cache_chunk.npy" % self.cache_path, chunk_data)
+            if not ((hasattr(self.wsi_handler.file_ptr, 'store')
+                    and '.zarr' in self.wsi_handler.file_ptr.store.path)):
+                chunk_data = self.wsi_handler.read_region(
+                    chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
+                )
+                chunk_data = np.array(chunk_data)[..., :3]
+                np.save("%s/cache_chunk.npy" % self.cache_path, chunk_data)
 
             pbar_desc = "Process Chunk %d/%d" % (idx, chunk_info_list.shape[0])
             patch_output_list = self.__run_model(
@@ -543,7 +545,7 @@ class InferManager(base.InferManager):
         wsi_name = path_obj.stem
 
         start = time.perf_counter()
-        self.wsi_handler = get_file_handler(wsi_path, backend=wsi_ext)
+        self.wsi_handler = get_file_handler(wsi_path, backend=wsi_ext, data_group=self.method['data_group'])
         self.wsi_proc_shape = self.wsi_handler.get_dimensions(self.proc_mag)
         self.wsi_handler.prepare_reading(
             read_mag=self.proc_mag, cache_path="%s/src_wsi.npy" % self.cache_path
@@ -559,8 +561,6 @@ class InferManager(base.InferManager):
                 "WARNING: No mask found, generating mask via thresholding at 1.25x!"
             )
 
-            from skimage import morphology
-
             # simple method to extract tissue regions using intensity thresholding and morphological operations
             def simple_get_mask():
                 scaled_wsi_mag = 1.25  # ! hard coded
@@ -574,7 +574,10 @@ class InferManager(base.InferManager):
                 mask = morphology.binary_dilation(mask, morphology.disk(16))
                 return mask
 
-            self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
+            if self.method['compressed_input']:
+                self.wsi_mask = np.ones(self.wsi_proc_shape, dtype=np.uint8)
+            else:
+                self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
         if np.sum(self.wsi_mask) == 0:
             log_info("Skip due to empty mask!")
             return

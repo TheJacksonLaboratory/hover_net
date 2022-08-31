@@ -13,6 +13,9 @@ from skimage import morphology as morph
 
 from misc.utils import cropping_center, get_bounding_box
 
+import imgaug as ia
+from imgaug import augmenters as iaa
+
 
 ####
 def fix_mirror_padding(ann):
@@ -107,3 +110,91 @@ def add_to_brightness(images, random_state, parents, hooks, range=None):
     ret = np.clip(img + value, 0, 255)
     ret = ret.astype(np.uint8)
     return [ret]
+
+
+def get_augmentation(input_shape, mode, rng, compressed_input=False):
+    if mode == "train":
+        shape_augs = [
+            # * order = ``0`` -> ``cv2.INTER_NEAREST``
+            # * order = ``1`` -> ``cv2.INTER_LINEAR``
+            # * order = ``2`` -> ``cv2.INTER_CUBIC``
+            # * order = ``3`` -> ``cv2.INTER_CUBIC``
+            # * order = ``4`` -> ``cv2.INTER_CUBIC``
+            # ! for pannuke v0, no rotation or translation, just flip to avoid mirror padding
+            iaa.Affine(
+                # scale images to 80-120% of their size, individually per axis
+                scale={"x": (0.8, 1.2), "y": (0.8, 1.2)},
+                # translate by -A to +A percent (per axis)
+                translate_percent={"x": (-0.01, 0.01), "y": (-0.01, 0.01)},
+                shear=(-5, 5),  # shear by -5 to +5 degrees
+                rotate=(-179, 179),  # rotate by -179 to +179 degrees
+                order=0,  # use nearest neighbour
+                backend="cv2",  # opencv for fast processing
+                seed=rng,
+            ),
+            # set position to 'center' for center crop
+            # else 'uniform' for random crop
+            iaa.CropToFixedSize(
+                input_shape[0], input_shape[1], position="center"
+            ),
+            iaa.Fliplr(0.5, seed=rng),
+            iaa.Flipud(0.5, seed=rng),
+        ]
+        if compressed_input:
+            input_augs = []
+        else:
+            input_augs = [
+                iaa.OneOf(
+                    [
+                        iaa.Lambda(
+                            seed=rng,
+                            func_images=lambda *args: gaussian_blur(*args, max_ksize=3),
+                        ),
+                        iaa.Lambda(
+                            seed=rng,
+                            func_images=lambda *args: median_blur(*args, max_ksize=3),
+                        ),
+                        iaa.AdditiveGaussianNoise(
+                            loc=0, scale=(0.0, 0.05 * 255), per_channel=0.5
+                        ),
+                    ]
+                ),
+                iaa.Sequential(
+                    [
+                        iaa.Lambda(
+                            seed=rng,
+                            func_images=lambda *args: add_to_hue(*args, range=(-8, 8)),
+                        ),
+                        iaa.Lambda(
+                            seed=rng,
+                            func_images=lambda *args: add_to_saturation(
+                                *args, range=(-0.2, 0.2)
+                            ),
+                        ),
+                        iaa.Lambda(
+                            seed=rng,
+                            func_images=lambda *args: add_to_brightness(
+                                *args, range=(-26, 26)
+                            ),
+                        ),
+                        iaa.Lambda(
+                            seed=rng,
+                            func_images=lambda *args: add_to_contrast(
+                                *args, range=(0.75, 1.25)
+                            ),
+                        ),
+                    ],
+                    random_order=True,
+                ),
+            ]
+    elif mode == "valid":
+        shape_augs = [
+            # set position to 'center' for center crop
+            # else 'uniform' for random crop
+            iaa.CropToFixedSize(
+                input_shape[0], input_shape[1], position="center"
+            )
+        ]
+        input_augs = []
+
+    return shape_augs, input_augs

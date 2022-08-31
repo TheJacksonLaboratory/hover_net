@@ -31,15 +31,12 @@ def train_step(batch_data, run_info):
     true_np = batch_data["np_map"]
     true_hv = batch_data["hv_map"]
 
-    # imgs = imgs.to("cuda").type(torch.float32)  # to NCHW
-    imgs = imgs.type(torch.float32)  # to NCHW
+    imgs = imgs.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.float32)  # to NCHW    
     imgs = imgs.permute(0, 3, 1, 2).contiguous()
 
     # HWC
-    # true_np = true_np.to("cuda").type(torch.int64)
-    # true_hv = true_hv.to("cuda").type(torch.float32)
-    true_np = true_np.type(torch.int64)
-    true_hv = true_hv.type(torch.float32)
+    true_np = true_np.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.int64)
+    true_hv = true_hv.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.float32)
 
     true_np_onehot = (F.one_hot(true_np, num_classes=2)).type(torch.float32)
     true_dict = {
@@ -125,8 +122,7 @@ def valid_step(batch_data, run_info):
     true_np = batch_data["np_map"]
     true_hv = batch_data["hv_map"]
 
-    # imgs_gpu = imgs.to("cuda").type(torch.float32)  # to NCHW
-    imgs_gpu = imgs.type(torch.float32)  # to NCHW
+    imgs_gpu = imgs.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.float32)  # to NCHW
     imgs_gpu = imgs_gpu.permute(0, 3, 1, 2).contiguous()
 
     # HWC
@@ -178,8 +174,7 @@ def infer_step(batch_data, model):
     ####
     patch_imgs = batch_data
 
-    # patch_imgs_gpu = patch_imgs.to("cuda").type(torch.float32)  # to NCHW
-    patch_imgs_gpu = patch_imgs.type(torch.float32)  # to NCHW
+    patch_imgs_gpu = patch_imgs.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.float32)  # to NCHW
     patch_imgs_gpu = patch_imgs_gpu.permute(0, 3, 1, 2).contiguous()
 
     ####
@@ -237,9 +232,10 @@ def viz_step_output(raw_data, nr_types=None):
     viz_list = []
     for idx in range(imgs.shape[0]):
         # img = center_pad_to_shape(imgs[idx], aligned_shape)
-        img = cropping_center(imgs[idx], aligned_shape)
+        # img = cropping_center(imgs[idx], aligned_shape)
 
-        true_viz_list = [img]
+        # true_viz_list = [img]
+        true_viz_list = []
         # cmap may randomly fails if of other types
         true_viz_list.append(colorize(true_np[idx], 0, 1))
         true_viz_list.append(colorize(true_hv[idx][..., 0], -1, 1))
@@ -248,7 +244,8 @@ def viz_step_output(raw_data, nr_types=None):
             true_viz_list.append(colorize(true_tp[idx], 0, nr_types))
         true_viz_list = np.concatenate(true_viz_list, axis=1)
 
-        pred_viz_list = [img]
+        # pred_viz_list = [img]
+        pred_viz_list = []
         # cmap may randomly fails if of other types
         pred_viz_list.append(colorize(pred_np[idx], 0, 1))
         pred_viz_list.append(colorize(pred_hv[idx][..., 0], -1, 1))

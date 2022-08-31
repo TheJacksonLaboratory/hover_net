@@ -34,7 +34,7 @@ from torch.nn import DataParallel  # TODO: switch to DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from config import Config
-from dataloader.train_loader import FileLoader
+from dataloader import FileLoader, LabeledZarrDataset, worker_init_fn, zarrdataset_worker_init
 from misc.utils import rm_n_mkdir
 from run_utils.engine import RunEngine
 from run_utils.utils import (
@@ -43,24 +43,6 @@ from run_utils.utils import (
     colored,
     convert_pytorch_checkpoint,
 )
-
-
-#### have to move outside because of spawn
-# * must initialize augmentor per worker, else duplicated rng generators may happen
-def worker_init_fn(worker_id):
-    # ! to make the seed chain reproducible, must use the torch random, not numpy
-    # the torch rng from main thread will regenerate a base seed, which is then
-    # copied into the dataloader each time it created (i.e start of each epoch)
-    # then dataloader with this seed will spawn worker, now we reseed the worker
-    worker_info = torch.utils.data.get_worker_info()
-    # to make it more random, simply switch torch.randint to np.randint
-    worker_seed = torch.randint(0, 2 ** 32, (1,))[0].cpu().item() + worker_id
-    # print('Loader Worker %d Uses RNG Seed: %d' % (worker_id, worker_seed))
-    # retrieve the dataset copied into this worker process
-    # then set the random seed for each augmentation
-    worker_info.dataset.setup_augmentor(worker_id, worker_seed)
-    return
-
 
 ####
 class TrainManager(Config):
@@ -98,37 +80,62 @@ class TrainManager(Config):
         nr_procs = nr_procs if not self.debug else 0
 
         # ! Hard assumption on file type
-        file_list = []
         if run_mode == "train":
             data_dir_list = self.train_dir_list
         else:
             data_dir_list = self.valid_dir_list
-        for dir_path in data_dir_list:
-            file_list.extend(glob.glob("%s/*.npy" % dir_path))
-        file_list.sort()  # to always ensure same input ordering
 
-        assert len(file_list) > 0, (
-            "No .npy found for `%s`, please check `%s` in `config.py`"
-            % (run_mode, "%s_dir_list" % run_mode)
-        )
-        print("Dataset %s: %d" % (run_mode, len(file_list)))
-        input_dataset = FileLoader(
-            file_list,
-            mode=run_mode,
-            with_type=self.type_classification,
-            setup_augmentor=nr_procs == 0,
-            target_gen=target_gen,
-            **self.shape_info[run_mode]
-        )
+        if self.src_fmt == '.npy':
+            file_list = []
+            for dir_path in data_dir_list:
+                file_list.extend(glob.glob("%s/*%s" % (dir_path,
+                                                       self.src_fmt)))
+            file_list.sort()  # to always ensure same input ordering
+
+            assert len(file_list) > 0, (
+                "No .npy found for `%s`, please check `%s` in `config.py`"
+                % (run_mode, "%s_dir_list" % run_mode)
+            )
+
+            print("Dataset %s: %d" % (run_mode, len(file_list)))
+
+            input_dataset = FileLoader(
+                file_list,
+                mode=run_mode,
+                with_type=self.type_classification,
+                setup_augmentor=nr_procs == 0,
+                target_gen=target_gen,
+                **self.shape_info[run_mode]
+            )
+            dataloader_worker_init_fn = worker_init_fn
+
+        elif '.zarr' in self.src_fmt:
+            input_dataset = LabeledZarrDataset(
+                data_dir_list,
+                patch_size=self.aug_shape[0],
+                input_shape=self.shape_info[run_mode]['input_shape'],
+                mask_shape=self.shape_info[run_mode]['mask_shape'],
+                data_mode=run_mode,
+                stride=self.stride,
+                workers=nr_procs,
+                data_group=self.data_group,
+                compression_level=self.compression_level,
+                compressed_input=self.compressed_input,
+                labels_group=self.labels_group,
+                with_type=self.type_classification,
+                setup_augmentor=nr_procs == 0,
+                target_gen=target_gen,
+                split_train=self.split_train,
+                split_val=self.split_val)
+            dataloader_worker_init_fn = zarrdataset_worker_init
 
         dataloader = DataLoader(
             input_dataset,
             num_workers=nr_procs,
-            # batch_size=batch_size * self.nr_gpus,
-            batch_size=batch_size,
+            batch_size=batch_size * max(self.nr_gpus, 1),
             shuffle=run_mode == "train",
             drop_last=run_mode == "train",
-            worker_init_fn=worker_init_fn,
+            worker_init_fn=dataloader_worker_init_fn,
         )
         return dataloader
 

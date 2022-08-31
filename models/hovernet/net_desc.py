@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .net_utils import (DenseBlock, Net, ResidualBlock, TFSamepaddingLayer,
-                        UpSample2x)
+                        UpSample2x, ProjectionBlock)
 from .utils import crop_op, crop_to_shape
 
 
@@ -160,10 +160,28 @@ class HoVerNetComp(Net):
         assert mode == 'compressed_rec', \
                 'Unknown mode `%s` for HoVerNetComp %s. Only support `compressed_rec`.' % mode
 
-        self.d0 = nn.Conv2d(in_channels=128, out_channels=256, kernel_size=1, stride=1, padding=0, bias=False)
-        self.d1 = nn.Conv2d(in_channels=128, out_channels=512, kernel_size=1, stride=1, padding=0, bias=False)
-        self.d2 = nn.Conv2d(in_channels=128, out_channels=1024, kernel_size=1, stride=1, padding=0, bias=False)
-        self.d3 = nn.Conv2d(in_channels=128, out_channels=1024, kernel_size=1, stride=1, padding=0, bias=False)
+        self.d0 = ProjectionBlock(in_channels=128, out_channels=256,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+        self.d1 = ProjectionBlock(in_channels=128, out_channels=512,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+        self.d2 = ProjectionBlock(in_channels=128,
+                                  out_channels=1024,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+        self.d3 = ProjectionBlock(in_channels=128,
+                                  out_channels=1024,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
 
         def create_decoder_branch(out_ch=2, ksize=5):
             module_list = [ 
@@ -279,4 +297,3 @@ def create_model(mode=None, **kwargs):
     if mode == 'compressed_rec':
         return HoVerNetComp(mode=mode, **kwargs)
     return HoVerNet(mode=mode, **kwargs)
-

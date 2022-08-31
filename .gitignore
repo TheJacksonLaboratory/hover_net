@@ -11,3 +11,4 @@ logs/
 *.npz
 *.png
 *.log
+.vscode/launch.json

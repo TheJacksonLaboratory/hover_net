@@ -267,6 +267,36 @@ class ResidualBlock(Net):
 
 
 ####
+class ProjectionBlock(Net):
+    """Projection block is a wrapper for compressed representation tensors.
+
+    This function allows to project the channels in the reconstruction track to
+    match those in the segmentation track of HoVer-Net.
+    """
+
+    def __init__(self, in_channels=128, out_channels=256, kernel_size=1,
+                 stride=1,
+                 padding=0,
+                 bias=False):
+        super(ProjectionBlock, self).__init__()
+
+        self.proj = nn.Conv2d(in_channels=in_channels,
+                              out_channels=out_channels,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=padding,
+                              bias=bias)
+
+    def forward(self, prev_feat, freeze=False):
+        if self.training:
+            with torch.set_grad_enabled(not freeze):
+                new_feat = self.proj(prev_feat)
+        else:
+            new_feat = self.proj(prev_feat)
+        return new_feat
+
+
+####
 class UpSample2x(nn.Module):
     """Upsample input by a factor of 2.
     

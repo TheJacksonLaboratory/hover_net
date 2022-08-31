@@ -16,11 +16,12 @@ from run_utils.engine import Events
 from .targets import gen_targets, prep_sample
 from .net_desc import create_model
 from .run_desc import proc_valid_step_output, train_step, valid_step, viz_step_output
+from .._autoencoders import Synthesizer
 
 
 # TODO: training config only ?
 # TODO: switch all to function name String for all option
-def get_config(nr_type, mode):
+def get_config(nr_type, mode, rec_model=None):
     return {
         # ------------------------------------------------------------------
         # ! All phases have the same number of run engine
@@ -32,7 +33,8 @@ def get_config(nr_type, mode):
                     "net": {
                         "desc": lambda: create_model(
                             input_ch=3, nr_types=nr_type, 
-                            freeze=True, mode=mode
+                            freeze=True, mode=mode,
+                            rec_model=rec_model
                         ),
                         "optimizer": [
                             optim.Adam,
@@ -52,12 +54,12 @@ def get_config(nr_type, mode):
                         },
                         # path to load, -1 to auto load checkpoint from previous phase,
                         # None to start from scratch
-                        "pretrained": "../pretrained/ImageNet-ResNet50-Preact_pytorch.tar",
-                        # 'pretrained': None,
+                        # "pretrained": "../pretrained/ImageNet-ResNet50-Preact_pytorch.tar",
+                        'pretrained': None,
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
-                "batch_size": {"train": 16, "valid": 16,},  # engine name : value
+                "batch_size": {"train": 2, "valid": 2,},  # engine name : value
                 "nr_epochs": 50,
             },
             {
@@ -66,7 +68,8 @@ def get_config(nr_type, mode):
                     "net": {
                         "desc": lambda: create_model(
                             input_ch=3, nr_types=nr_type, 
-                            freeze=False, mode=mode
+                            freeze=False, mode=mode,
+                            rec_model=rec_model
                         ),
                         "optimizer": [
                             optim.Adam,
@@ -90,7 +93,7 @@ def get_config(nr_type, mode):
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
-                "batch_size": {"train": 4, "valid": 8,}, # batch size per gpu
+                "batch_size": {"train": 2, "valid": 2,}, # batch size per gpu
                 "nr_epochs": 50,
             },
         ],
@@ -102,7 +105,7 @@ def get_config(nr_type, mode):
             "train": {
                 # TODO: align here, file path or what? what about CV?
                 "dataset": "",  # whats about compound dataset ?
-                "nr_procs": 16,  # number of threads for dataloader
+                "nr_procs": 0,  # number of threads for dataloader
                 "run_step": train_step,  # TODO: function name or function variable ?
                 "reset_per_run": False,
                 # callbacks are run according to the list order of the event
@@ -123,7 +126,7 @@ def get_config(nr_type, mode):
             },
             "valid": {
                 "dataset": "",  # whats about compound dataset ?
-                "nr_procs": 8,  # number of threads for dataloader
+                "nr_procs": 0,  # number of threads for dataloader
                 "run_step": valid_step,
                 "reset_per_run": True,  # * to stop aggregating output etc. from last run
                 # callbacks are run according to the list order of the event

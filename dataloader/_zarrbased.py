@@ -1,8 +1,7 @@
-import math
 import os
+import math
 from functools import reduce
 
-import math
 import numpy as np
 import zarr
 
@@ -10,6 +9,10 @@ from PIL import Image
 
 import torch
 from torch.utils.data import Dataset
+
+from .augs import get_augmentation
+from imgaug import augmenters as iaa
+from misc.utils import cropping_center
 
 
 def compute_num_patches(size, patch_size, padding, stride):
@@ -170,14 +173,18 @@ def compute_grid(index,
     return i, tl_y, tl_x
 
 
-def get_patch(z, tl_y, tl_x, patch_size, padding, stride):
+def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
+              compression_level=0):
     """
     Gets a squared region from an array z (numpy or zarr).
 
     Parameters:
     ----------
-    z : dask.array.core.Array, numpy.array or zarr.array
-        A full array from where to take a patch
+    z : numpy.array or zarr.array
+        A full array from where to take a patch.
+    shape : tuple of ints
+        Shape of the original array. For compressed representation of images,
+        the shape of the uncompressed image.
     tl_y : int
         Top left coordinate in the y-axis
     tl_x : int
@@ -188,6 +195,9 @@ def get_patch(z, tl_y, tl_x, patch_size, padding, stride):
         Padding added to the source image prior to retrieve the patch.
     stride : tuple of ints
         The spacing in each axis (x, y) between each patch retrieved.
+    compression_level : int
+        In case that the input is a comrpessed representation, pass the level
+        of compression.
 
     Returns
     -------
@@ -200,17 +210,21 @@ def get_patch(z, tl_y, tl_x, patch_size, padding, stride):
     # It is taken from the first axis only when the input is a three
     # dimensional array.
     c = z.shape[1 if z.ndim > 3 else 0]
-    H, W = z.shape[-2:]
+    H, W = shape[-2:]
 
     tl_x_padding = tl_x - padding[0]
     br_x_padding = tl_x + patch_size + padding[1]
     tl_y_padding = tl_y - padding[2]
     br_y_padding = tl_y + patch_size + padding[3]
 
-    tl_y = max(tl_y_padding, 0)
-    tl_x = max(tl_x_padding, 0)
-    br_y = min(br_y_padding, H)
-    br_x = min(br_x_padding, W)
+    tl_y = max(tl_y_padding, 0) // 2 ** compression_level
+    tl_x = max(tl_x_padding, 0) // 2 ** compression_level
+    br_y = min(br_y_padding, H) // 2 ** compression_level
+    br_x = min(br_x_padding, W) // 2 ** compression_level
+    tl_x_padding //= 2 ** compression_level
+    br_x_padding //= 2 ** compression_level
+    tl_y_padding //= 2 ** compression_level
+    br_y_padding //= 2 ** compression_level
 
     patch = z[..., tl_y:br_y, tl_x:br_x].squeeze()
 
@@ -221,7 +235,8 @@ def get_patch(z, tl_y, tl_x, patch_size, padding, stride):
     leading_padding = [(0, 0)] * (patch.ndim - 2)
 
     # Pad the patch using the symmetric mode
-    if patch.shape[-2] < patch_size or patch.shape[-1] < patch_size:
+    if (patch.shape[-2] < patch_size // 2 ** compression_level
+       or patch.shape[-1] < patch_size // 2 ** compression_level):
         pad_up = tl_y - tl_y_padding
         pad_down = br_y_padding - br_y
         pad_left = tl_x - tl_x_padding
@@ -261,6 +276,13 @@ def zarrdataset_worker_init(worker_id):
     _, dataset_obj._max_H, dataset_obj._max_W, dataset_obj._org_channels, dataset_obj._imgs_sizes, dataset_obj._imgs_shapes = dataset_obj._compute_size(dataset_obj._z_list, dataset_obj._rois_list)
     dataset_obj._dataset_size //= worker_info.num_workers
 
+    # to make it more random, simply switch torch.randint to np.randint
+    worker_seed = torch.randint(0, 2 ** 32, (1,))[0].cpu().item() + worker_id
+    # print('Loader Worker %d Uses RNG Seed: %d' % (worker_id, worker_seed))
+    # retrieve the dataset copied into this worker process
+    # then set the random seed for each augmentation
+    worker_info.dataset.setup_augmentor(worker_id, worker_seed)
+
 
 class ZarrDataset(Dataset):
     """ A zarr-based dataset.
@@ -281,6 +303,8 @@ class ZarrDataset(Dataset):
                  by_rows=True,
                  compression_level=0,
                  compressed_input=False,
+                 split_train=0.7,
+                 split_val=0.1,
                  **kwargs):
 
         if padding is None:
@@ -293,6 +317,8 @@ class ZarrDataset(Dataset):
             stride = (stride, stride)
 
         self._dataset_size = dataset_size
+        self._split_train = split_train
+        self._split_val = split_val
         self._transform = transform
         self._patch_size = patch_size
         self._padding = padding
@@ -336,14 +362,14 @@ class ZarrDataset(Dataset):
             # If the input is a list of any supported inputs, iterate each element
             # Check if an element in the list corresponds to the current data mode
             source_mode = list(filter(lambda fn: self._data_mode in fn, source))
-            
+
             if len(source_mode) > 0:
                 # Only if there is at least one element specific to the data mode, use it.
                 # Otherwise, recurse the original source list
                 source = source_mode
-            
+
             return reduce(lambda l1, l2: l1 + l2, map(self._get_filenames, source), [])
-        
+
         elif isinstance(source, str) and source.lower().endswith('txt'):
             self._requires_split = self._data_mode.lower() != 'all' and not self._data_mode.lower() in source.lower()
 
@@ -368,7 +394,7 @@ class ZarrDataset(Dataset):
 
         # If the source file/path does not meet the criteria, return an empty list
         return []
-    
+
     def _split_dataset(self, root):
         """ Identify are the inputs being passed and split the data according to the mode.
         The datasets will be splitted into 70% training, 10% validation, and 20% testing.
@@ -377,15 +403,25 @@ class ZarrDataset(Dataset):
         filenames = self._get_filenames(root)
 
         if self._requires_split:
-            if self._data_mode == 'train':
+            if self._split_train <= 1.0:
+                train_size = int(self._split_train * len(filenames))
+            else:
+                train_size = int(self._split_train)
+
+            if self._split_val <= 1.0:
+                val_size = int(self._split_val * len(filenames))
+            else:
+                val_size = self._split_val
+
+            if 'train' in self._data_mode:
                 # Use 70% of the data for traning
-                filenames = filenames[:int(0.7 * len(filenames))]
-            elif self._data_mode == 'val':
+                filenames = filenames[:train_size]
+            elif 'val' in self._data_mode:
                 # Use 10% of the data for validation
-                filenames = filenames[int(0.7 * len(filenames)):int(0.8 * len(filenames))]
-            elif self._data_mode == 'test':
+                filenames = filenames[train_size:train_size+val_size]
+            elif 'test' in self._data_mode:
                 # Use 20% of the data for testing
-                filenames = filenames[int(0.8 * len(filenames)):]
+                filenames = filenames[train_size+val_size:]
 
         return filenames
 
@@ -405,14 +441,23 @@ class ZarrDataset(Dataset):
                     arr_src = zarr.open(arr_src, mode='r')
 
                 arr = arr_src[group]
-
+                if self._compressed_input and 'compressed' in arr_src.keys() and 'compression_metadata' in arr_src['compressed'].attrs.keys():
+                    comp_metadata = arr_src['compressed'].attrs['compression_metadata']
+                    compressed_channels = comp_metadata['compressed_channels']
+                    org_H = comp_metadata['height']
+                    org_W = comp_metadata['width']
+                    arr_shape = (1, compressed_channels, 1, org_H, org_W)
+                else:
+                    arr_shape = arr.shape
             elif isinstance(arr_src, str) and '.zarr' not in self._source_format:
                 # If the input is a path to an image stored in a format supported by PIL, open it and use it as a numpy array
                 arr = load_image(arr_src)
                 arr = zarr.array(arr, chunks=(1, arr.shape[1], 1, self._patch_size, self._patch_size))
+                arr_shape = arr.shape
             else:
                 # Otherwise, use directly the zarr array
                 arr = arr_src
+                arr_shape = arr.shape
 
             z_list.append(arr)
 
@@ -434,7 +479,7 @@ class ZarrDataset(Dataset):
                     rois_list.append((id, tuple(roi)))
 
             else:
-                roi = [slice(0, s, 1) for s in arr.shape]
+                roi = [slice(0, s, 1) for s in arr_shape]
                 rois_list.append((id, tuple(roi)))
 
         return z_list, rois_list
@@ -482,20 +527,20 @@ class ZarrDataset(Dataset):
                                      self._by_rows)
         id, roi = self._rois_list[i]
         patch = get_patch(self._z_list[id].get_orthogonal_selection(roi),
+                          self._imgs_shapes[id],
                           tl_y,
                           tl_x,
                           self._patch_size,
                           self._padding,
-                          self._stride).squeeze()
+                          self._stride,
+                          self._compression_level).squeeze()
 
         patch = patch.transpose(1, 2, 0)
 
         if self._transform is not None:
             patch = self._transform(patch)
 
-        stride = tuple(map(lambda s: s * ((2**self._compression_level) if self._compressed_input else 1), self._stride))
-
-        patch_info = np.array([tl_y * stride[1], tl_x * stride[0]])
+        patch_info = np.array([tl_y * self._stride[1], tl_x * self._stride[0]])
         return patch, patch_info
 
     def get_channels(self):
@@ -509,9 +554,17 @@ class LabeledZarrDataset(ZarrDataset):
     """ A labeled dataset based on the zarr dataset class.
         The densely labeled targets are extracted from group '1'.
     """
-    def __init__(self, root, input_target_transform=None, target_transform=None, compression_level=0, compressed_input=False, labels_group='labels/0/0', labels_data_axes=None, **kwargs):
+    def __init__(self, root,
+                 with_type=False,
+                 input_shape=None,
+                 mask_shape=None,
+                 labels_group='labels/0/0',
+                 labels_data_axes=None,
+                 setup_augmentor=False,
+                 target_gen=None,
+                 **kwargs):
         super(LabeledZarrDataset, self).__init__(root, **kwargs)
-        
+
         # Open the labels from the labels group
         self._labels_group = labels_group
         if labels_data_axes is None:
@@ -521,14 +574,17 @@ class LabeledZarrDataset(ZarrDataset):
             self._preload_files(self._filenames, group=self._labels_group,
                                 data_axes=self._labels_data_axes)
 
-        self._compression_level = compression_level
-        self._compressed_input = compressed_input
+        self.shape_augs = None
+        self.input_augs = None
+        self.id = 0
+        self.input_shape = input_shape
+        self.mask_shape = mask_shape
+        self.with_type = with_type
+        self.target_gen_func = target_gen[0]
+        self.target_gen_kwargs = target_gen[1]
 
-        # This is a transform that affects the geometry of the input, and then it has to be applied to the target as well
-        self._input_target_transform = input_target_transform
-
-        # This is a transform that only affects the target
-        self._target_transform = target_transform
+        if setup_augmentor:
+            self.setup_augmentor(0, 0)
 
     def __getitem__(self, index):
         i, tl_y, tl_x = compute_grid(index, self._imgs_shapes,
@@ -538,32 +594,59 @@ class LabeledZarrDataset(ZarrDataset):
                                      self._stride,
                                      self._by_rows)
         id, roi = self._rois_list[i]
-        patch = get_patch(self._z_list[id].get_orthogonal_selection(roi),
-                          tl_y,
-                          tl_x,
-                          self._patch_size,
-                          self._padding,
-                          self._stride).squeeze()
+        img = get_patch(self._z_list[id].get_orthogonal_selection(roi),
+                        self._imgs_shapes[id],
+                        tl_y,
+                        tl_x,
+                        self._patch_size,
+                        self._padding,
+                        self._stride,
+                        self._compression_level).squeeze()
 
-        if self._transform is not None:
-            patch = self._transform(patch.transpose(1, 2, 0))
+        img = np.moveaxis(img, 0, -1).astype("uint8")
 
         id, roi = self._lab_rois_list[i]
-        patch_size = self._patch_size * ((2**self._compression_level) if self._compressed_input else 1)
-        padding = tuple(map(lambda s: s * ((2**self._compression_level) if self._compressed_input else 1), self._padding))
-        stride = tuple(map(lambda s: s * ((2**self._compression_level) if self._compressed_input else 1), self._stride))
-        target = get_patch(self._lab_list[id].get_orthogonal_selection(roi),
-                           tl_y,
-                           tl_x,
-                           patch_size,
-                           padding,
-                           stride).astype(np.float32)
+        ann = get_patch(self._lab_list[id].get_orthogonal_selection(roi),
+                        self._imgs_shapes[id],
+                        tl_y,
+                        tl_x,
+                        self._patch_size,
+                        self._padding,
+                        self._stride,
+                        0)
+        ann = np.moveaxis(ann, 0, -1).astype("int32")
 
-        if self._input_target_transform:
-            patch, target = self._input_target_transform((patch, target))
+        if self.shape_augs is not None:
+            shape_augs = self.shape_augs.to_deterministic()
+            img = shape_augs.augment_image(img)
+            ann = shape_augs.augment_image(ann)
 
-        if self._target_transform:
-            target = self._target_transform(target)
+        if self.input_augs is not None:
+            input_augs = self.input_augs.to_deterministic()
+            img = input_augs.augment_image(img)
+
+        img = cropping_center(img, [int(math.ceil(s // 2**self._compression_level)) for s in self.input_shape])
+        feed_dict = {"img": img}
+        inst_map = ann[..., 0]  # HW1 -> HW
+        if self.with_type:
+            type_map = (ann[..., 1]).copy()
+            type_map = cropping_center(type_map, self.mask_shape)
+            # type_map[type_map == 5] = 1  # merge neoplastic and non-neoplastic
+            feed_dict["tp_map"] = type_map
+
+        target_dict = self.target_gen_func(
+            inst_map, self.mask_shape, **self.target_gen_kwargs
+        )
+        feed_dict.update(target_dict)
 
         # Returns anything as label, to prevent an error during training
-        return patch, target
+        return feed_dict
+
+    def setup_augmentor(self, worker_id, seed):
+        self.augmentor = get_augmentation(self.input_shape, self._data_mode,
+                                          seed,
+                                          self._compressed_input)
+        self.shape_augs = iaa.Sequential(self.augmentor[0])
+        self.input_augs = iaa.Sequential(self.augmentor[1])
+        self.id = self.id + worker_id
+        return
