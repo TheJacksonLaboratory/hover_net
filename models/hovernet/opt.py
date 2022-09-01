@@ -3,6 +3,7 @@ import torch.optim as optim
 from run_utils.callbacks.base import (
     AccumulateRawOutput,
     PeriodicSaver,
+    ConditionalSaver,
     ProcessAccumulatedRawOutput,
     ScalarMovingAverage,
     ScheduleLr,
@@ -59,7 +60,7 @@ def get_config(nr_type, mode, rec_model=None):
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
-                "batch_size": {"train": 2, "valid": 2,},  # engine name : value
+                "batch_size": {"train": 16, "valid": 16,},  # engine name : value
                 "nr_epochs": 50,
             },
             {
@@ -93,7 +94,7 @@ def get_config(nr_type, mode, rec_model=None):
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
-                "batch_size": {"train": 2, "valid": 2,}, # batch size per gpu
+                "batch_size": {"train": 4, "valid": 8,}, # batch size per gpu
                 "nr_epochs": 50,
             },
         ],
@@ -116,9 +117,10 @@ def get_config(nr_type, mode, rec_model=None):
                     ],
                     Events.EPOCH_COMPLETED: [
                         TrackLr(),
-                        PeriodicSaver(),
+                        # PeriodicSaver(),
                         VisualizeOutput(viz_step_output),
                         LoggingEpochOutput(),
+                        ConditionalSaver("train-overall_loss", comparator="<="),
                         TriggerEngine("valid"),
                         ScheduleLr(),
                     ],
