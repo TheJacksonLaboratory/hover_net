@@ -21,8 +21,8 @@ class Config(object):
         self.debug = False
 
         model_name = "hovernet"
-        # model_mode = "compressed_rec" # choose either `original` or `fast`
-        model_mode = "fast" # choose either `original` or `fast`
+        model_mode = "compressed_rec" # choose either `original` or `fast`
+        # model_mode = "fast" # choose either `original` or `fast`
 
         if model_mode not in ["original", "fast", "compressed_rec"]:
             raise Exception("Must use either `original`, `fast`, or `compressed_rec` as model mode")
@@ -49,11 +49,12 @@ class Config(object):
                 raise Exception("If using `fast` mode, input shape must be [256,256] and output shape must be [164,164]")
 
         self.dataset_name = "monusac" # extracts dataset info from dataset.py
-        self.log_dir = r"C:\Users\cervaf\Documents\Logging\hover_net\train_log" # where checkpoints will be saved
+        # self.log_dir = "/mnt/logs" # where checkpoints will be saved
+        self.log_dir = "/mnt/logs" # where checkpoints will be saved
 
         rec_model = None
-        rec_model_path = None
-        # rec_model_path = r'C:\Users\cervaf\OneDrive - The Jackson Laboratory\Projects\2021\Autoencoder_compressor\trained_models\best_ver0.5.5_32203.pth'
+        # rec_model_path = None
+        rec_model_path = "/mnt/models/best_ver0.5.5_32203.pth"
 
         if rec_model_path is not None:
             saved_state_dict = torch.load(rec_model_path, map_location='cpu')
@@ -66,22 +67,22 @@ class Config(object):
 
         # paths to training and validation patches
         self.train_dir_list = [
-            r"C:\Users\cervaf\Documents\Datasets\MoNuSAC\MoNuSAC_images_and_annotations\MoNuSAC_train_valid"
+            "/mnt/data/train_list.txt"
         ]
         self.valid_dir_list = [
-            r"C:\Users\cervaf\Documents\Datasets\MoNuSAC\MoNuSAC_images_and_annotations\MoNuSAC_train_valid"
+            "/mnt/data/valid_list.txt"
         ]
-        # self.src_fmt = ".zarr"
-        self.src_fmt = ".npy"
+        
+        self.src_fmt = ".zarr"
         self.split_train=168
         self.split_val=41
         self.labels_group = "labels/0/0"
-        # self.data_group = "compressed/0/0"
-        # self.compression_level = 3
-        # self.compressed_input = True
-        self.data_group = "0/0"
-        self.compression_level = 0
-        self.compressed_input = False
+        self.data_group = "compressed/0/0"
+        self.compression_level = 3
+        self.compressed_input = True
+        # self.data_group = "0/0"
+        # self.compression_level = 0
+        # self.compressed_input = False
 
         self.shape_info = {
             "train": {"input_shape": act_shape, "mask_shape": out_shape,},

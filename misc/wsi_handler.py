@@ -7,13 +7,7 @@ import zarr
 import ome_types
 
 
-OPENSLIDE_PATH = r'C:\Users\cervaf\Documents\Apps\openslide\bin'
-if hasattr(os, 'add_dll_directory'):
-    # Python >= 3.8 on Windows
-    with os.add_dll_directory(OPENSLIDE_PATH):
-        import openslide
-else:
-    import openslide
+import openslide
 
 
 class FileHandler(object):
