@@ -72,7 +72,7 @@ class InferManager(object):
         model_creator = getattr(model_desc, "create_model")
 
         net = model_creator(**self.method["model_args"])
-        saved_state_dict = torch.load(self.method["model_path"])["desc"]
+        saved_state_dict = torch.load(self.method["model_path"], map_location=None if torch.cuda.is_available() else 'cpu')["desc"]
         saved_state_dict = convert_pytorch_checkpoint(saved_state_dict)
 
         net.load_state_dict(saved_state_dict, strict=True)

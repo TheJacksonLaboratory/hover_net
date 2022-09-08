@@ -285,6 +285,7 @@ class ProjectionBlock(Net):
                               kernel_size=kernel_size,
                               stride=stride,
                               padding=padding,
+                              groups=in_channels,
                               bias=bias)
 
     def forward(self, prev_feat, freeze=False):

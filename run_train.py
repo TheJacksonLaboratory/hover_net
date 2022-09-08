@@ -174,10 +174,15 @@ class TrainManager(Config):
             with open(stat_file_path) as stat_file:
                 info = json.load(stat_file)
             epoch_list = [int(v) for v in info.keys()]
-            last_chkpts_path = "%s/%s_epoch=%d.tar" % (
+            # last_chkpts_path = "%s/%s_epoch=%d.tar" % (
+            #     prev_phase_dir,
+            #     net_name,
+            #     max(epoch_list),
+            # )
+            last_chkpts_path = "%s/%s_best=[%s].tar" % (
                 prev_phase_dir,
                 net_name,
-                max(epoch_list),
+                "train-overall_loss",
             )
             return last_chkpts_path
 
