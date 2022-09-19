@@ -69,7 +69,7 @@ options:
     --proc_mag=<n>          Magnification level (objective power) used for WSI processing. [default: 40]
     --ambiguous_size=<int>  Define ambiguous region along tiling grid to perform re-post processing. [default: 128]
     --chunk_shape=<n>       Shape of chunk for processing. [default: 10000]
-    --tile_shape=<n>        Shape of tiles for processing. [default: 2048]
+    --tile_shape=<n>        Shape of tiles for processing. [default: 512]
     --save_thumb            To save thumb. [default: False]
     --save_mask             To save mask. [default: False]
 """

@@ -22,11 +22,13 @@ from importlib import import_module
 import cv2
 import numpy as np
 import zarr
+import dask
+import dask.array as da
 from numcodecs import Blosc
 import psutil
 import scipy.io as sio
-from skimage import morphology
 import torch
+from skimage import morphology
 import torch.utils.data as data
 from torchvision import transforms
 import tqdm
@@ -241,10 +243,11 @@ def _post_proc_para_wrapper(pred_map_mmap_path, tile_info, func, func_kwargs):
 def _post_proc_para_wrapper_zarr(pred_map_mmap_path, tile_info, func, func_kwargs):
     """Wrapper for parallel post processing."""
     idx, tile_tl, tile_br = tile_info
-    wsi_pred_map_ptr = zarr.open(pred_map_mmap_path, mode="r")
+    wsi_pred_map_ptr = zarr.open(pred_map_mmap_path, "r")
     tile_pred_map = wsi_pred_map_ptr[0, :, 0, tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]].transpose(1, 2, 0)
 
     return func(tile_pred_map, **func_kwargs), tile_info
+    # return da.map_blocks(func, tile_pred_map, **func_kwargs, dtype=np.float32, meta=np.empty((), dtype=np.float32), chunks=(4, 226, 610))
 
 
 ####
@@ -320,8 +323,7 @@ class InferManager(base.InferManager):
                                   data_group=self.method['data_group'] + '/0',
                                   by_rows=False,
                                   compression_level=compression_level,
-                                  compressed_input=self.method['compressed_input']
-                    )
+                                  compressed_input=self.method['compressed_input'])
         else:
             dataset = SerializeArray(
                 "%s/cache_chunk.npy" % self.cache_path,
@@ -354,8 +356,18 @@ class InferManager(base.InferManager):
             curr_batch_size = sample_output_list.shape[0]
             sample_output_list = np.split(sample_output_list, curr_batch_size, axis=0)
             sample_info_list = np.split(sample_info_list, curr_batch_size, axis=0)
-            sample_output_list = list(zip(sample_info_list, sample_output_list))
-            accumulated_patch_output.extend(sample_output_list)
+
+            if isinstance(self.wsi_pred_map, zarr.Array):
+                offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
+                for pos, pred in zip(sample_info_list, sample_output_list):
+                    self.wsi_pred_map[0, :, 0,
+                                      offset + pos[0, 0]:offset + pos[0, 0] + pred.shape[1],
+                                      offset + pos[0, 1]:offset + pos[0, 1] + pred.shape[2]] = \
+                                        pred[0].transpose(2, 0, 1)
+            else:
+                sample_output_list = list(zip(sample_info_list, sample_output_list))            
+                accumulated_patch_output.extend(sample_output_list)
+
             pbar.update()
         pbar.close()
         return accumulated_patch_output
@@ -399,14 +411,6 @@ class InferManager(base.InferManager):
         """
         # 1 dedicated thread just to write results back to disk
         proc_pool = Pool(processes=1)
-        if (hasattr(self.wsi_handler.file_ptr, 'store')
-           and '.zarr' in self.wsi_handler.file_ptr.store.path):
-            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
-            assemble_fun = _assemble_and_flush_zarr
-        else:
-            wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
-            assemble_fun = _assemble_and_flush
-
         masking = lambda x, a, b: (a <= x) & (x <= b)
         for idx in range(0, chunk_info_list.shape[0]):
             chunk_info = chunk_info_list[idx]
@@ -426,7 +430,10 @@ class InferManager(base.InferManager):
             # there no valid patches, so flush 0 and skip
             if chunk_patch_info_list.shape[0] == 0:
                 proc_pool.apply_async(
-                    _assemble_and_flush, args=(wsi_pred_map_mmap_path, chunk_info, None)
+                    _assemble_and_flush,
+                    args=("%s/pred_map.npy" % self.cache_path,
+                          chunk_info,
+                          None)
                 )
                 continue
 
@@ -445,10 +452,14 @@ class InferManager(base.InferManager):
                 chunk_patch_info_list[:, 0, 0], pbar_desc
             )
 
-            proc_pool.apply_async(
-                assemble_fun,
-                args=(wsi_pred_map_mmap_path, chunk_info, patch_output_list),
-            )
+            if not (hasattr(self.wsi_handler.file_ptr, 'store')
+                   and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                proc_pool.apply_async(
+                    _assemble_and_flush,
+                    args=("%s/pred_map.npy" % self.cache_path,
+                          chunk_info,
+                          patch_output_list),
+                )
         proc_pool.close()
         proc_pool.join()
         return
@@ -720,9 +731,15 @@ class InferManager(base.InferManager):
 
             # * exclude ambiguous out from old prediction map
             # check 1 pix of 4 edges to find nuclei split at boundary
-            roi_inst = self.wsi_inst_map[
-                tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-            ]
+            if self.wsi_inst_map.ndim > 2:
+                roi_inst = self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ]
+            else:
+                roi_inst = self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ]
+
             roi_inst = np.copy(roi_inst)
             roi_edge = np.concatenate(
                 [roi_inst[[0, -1], :].flatten(), roi_inst[:, [0, -1]].flatten()]
@@ -733,9 +750,14 @@ class InferManager(base.InferManager):
                 roi_inner_inst_list, roi_boundary_inst_list, assume_unique=True
             )
             roi_inst = _remove_inst(roi_inst, roi_inner_inst_list)
-            self.wsi_inst_map[
-                tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-            ] = roi_inst
+            if self.wsi_inst_map.ndim > 2:
+                self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = roi_inst
+            else:
+                self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = roi_inst
             for inst_id in roi_inner_inst_list:
                 self.wsi_inst_info.pop(inst_id, None)
 
@@ -765,9 +787,14 @@ class InferManager(base.InferManager):
                 self.wsi_inst_info[inst_id + wsi_max_id] = inst_info
             pred_inst[pred_inst > 0] += wsi_max_id
             pred_inst = roi_inst + pred_inst
-            self.wsi_inst_map[
-                tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-            ] = pred_inst
+            if self.wsi_inst_map.ndim > 2:
+                self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
+            else:
+                self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
 
             pbar.update()  # external
             return
@@ -782,9 +809,7 @@ class InferManager(base.InferManager):
         pbar.close()
 
         pbar = pbar_creator(tile_boundary_info, "Post Proc Phase 2")
-        self.__dispatch_post_processing(
-            tile_boundary_info, post_proc_fixing_tile_callback
-        )
+        self.__dispatch_post_processing(tile_boundary_info, post_proc_fixing_tile_callback)
         pbar.close()
 
         pbar = pbar_creator(tile_cross_info, "Post Proc Phase 3")

@@ -54,7 +54,7 @@ def parse_roi(filename):
     ----------
     filename : str, numpy.ndarray, zarr.Array, or zarr.Group
         Path to the image
-    
+
     Returns
     -------
     fn : str
@@ -73,12 +73,12 @@ def parse_roi(filename):
         fn = filename
         z = zarr.open(filename, 'r')   
         rois = z.attrs.get('rois', [])
-    
+
     elif isinstance(filename, str):
         broken_filename = filename.split(";")
         fn = broken_filename[0]
         rois_str = broken_filename[1:]
-    
+
         for roi in rois_str:
             start_coords, axis_lengths = roi.split(':')
             start_coords = tuple([int(c.strip('\n\r ()')) for c in start_coords.split(',')])
@@ -96,7 +96,7 @@ def load_image(filename):
     ----------
     filename : str
         Path to the image
-    
+
     Returns
     -------
     arr : numpy.array
@@ -110,12 +110,7 @@ def load_image(filename):
     return arr
 
 
-def compute_grid(index,
-                 imgs_shapes,
-                 imgs_sizes,
-                 patch_size,
-                 padding,
-                 stride,
+def compute_grid(index, imgs_shapes, imgs_sizes, patch_size, padding, stride,
                  by_rows=True):
     """ Compute the coordinate on a grid of indices corresponding to 'index'.
 
@@ -175,13 +170,12 @@ def compute_grid(index,
 
 def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
               compression_level=0):
-    """
-    Gets a squared region from an array z (numpy or zarr).
+    """Get a squared region from an array z (numpy or zarr).
 
     Parameters:
     ----------
-    z : numpy.array or zarr.array
-        A full array from where to take a patch.
+    z : dask.array.core.Array, numpy.array or zarr.array
+        A full array from where to take a patch
     shape : tuple of ints
         Shape of the original array. For compressed representation of images,
         the shape of the uncompressed image.
@@ -203,12 +197,11 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     -------
     patch : numpy.array
     """
-    tl_x *= stride[0]
-    tl_y *= stride[1]
+    tl_y *= stride[0]
+    tl_x *= stride[1]
 
-    # The color channel is considered to be in the second axis for convention.
-    # It is taken from the first axis only when the input is a three
-    # dimensional array.
+    # TODO extract this information from the zarr metadata. For now, the color
+    # channel is considered to be in the second axis.
     c = z.shape[1 if z.ndim > 3 else 0]
     H, W = shape[-2:]
 
@@ -231,7 +224,8 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     if c == 1:
         patch = patch[np.newaxis, ...]
 
-    # In the case that the input patch contains more than three dimensions, pad the leading dimensions with (0, 0)
+    # In the case that the input patch contains more than three dimensions, pad
+    # the leading dimensions with (0, 0).
     leading_padding = [(0, 0)] * (patch.ndim - 2)
 
     # Pad the patch using the symmetric mode
