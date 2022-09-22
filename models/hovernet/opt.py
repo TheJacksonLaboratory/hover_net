@@ -56,7 +56,7 @@ def get_config(nr_type, mode, rec_model=None):
                         # path to load, -1 to auto load checkpoint from previous phase,
                         # None to start from scratch
                         # "pretrained": "../pretrained/ImageNet-ResNet50-Preact_pytorch.tar",
-                        'pretrained': None,
+                        "pretrained": None,
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},

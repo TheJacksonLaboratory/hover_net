@@ -365,7 +365,7 @@ class InferManager(base.InferManager):
                                       offset + pos[0, 1]:offset + pos[0, 1] + pred.shape[2]] = \
                                         pred[0].transpose(2, 0, 1)
             else:
-                sample_output_list = list(zip(sample_info_list, sample_output_list))            
+                sample_output_list = list(zip(sample_info_list, sample_output_list))     
                 accumulated_patch_output.extend(sample_output_list)
 
             pbar.update()
@@ -585,10 +585,12 @@ class InferManager(base.InferManager):
                 mask = morphology.binary_dilation(mask, morphology.disk(16))
                 return mask
 
-            if self.method['compressed_input']:
+            if ((hasattr(self.wsi_handler.file_ptr, 'store')
+               and '.zarr' in self.wsi_handler.file_ptr.store.path)):
                 self.wsi_mask = np.ones(self.wsi_proc_shape, dtype=np.uint8)
             else:
                 self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
+
         if np.sum(self.wsi_mask) == 0:
             log_info("Skip due to empty mask!")
             return
@@ -868,5 +870,10 @@ class InferManager(base.InferManager):
                 log_info("Finish")
             except:
                 logging.exception("Crash")
+
+            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+            source = zarr.open(wsi_pred_map_mmap_path, mode="r")
+            dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
+            zarr.copy(source, dest_group, '0')
         # rm_n_mkdir(self.cache_path)  # clean up all cache
         return

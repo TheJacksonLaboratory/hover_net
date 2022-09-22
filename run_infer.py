@@ -180,7 +180,7 @@ if __name__ == '__main__':
             'save_mask'      : sub_args['save_mask'],
         })
     # ***
-    
+
     if sub_cmd == 'tile':
         from infer.tile import InferManager
         infer = InferManager(**method_args)

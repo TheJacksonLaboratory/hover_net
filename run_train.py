@@ -112,6 +112,7 @@ class TrainManager(Config):
         elif '.zarr' in self.src_fmt:
             input_dataset = LabeledZarrDataset(
                 data_dir_list,
+                dataset_size=5000,
                 patch_size=self.aug_shape[0],
                 input_shape=self.shape_info[run_mode]['input_shape'],
                 mask_shape=self.shape_info[run_mode]['mask_shape'],
