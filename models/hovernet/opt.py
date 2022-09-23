@@ -22,7 +22,7 @@ from .._autoencoders import Synthesizer
 
 # TODO: training config only ?
 # TODO: switch all to function name String for all option
-def get_config(nr_type, mode, rec_model=None, pretrained_model_filename=None):
+def get_config(nr_type, mode, net_channels=None, rec_model=None, pretrained_model_filename=None):
     return {
         # ------------------------------------------------------------------
         # ! All phases have the same number of run engine
@@ -35,7 +35,8 @@ def get_config(nr_type, mode, rec_model=None, pretrained_model_filename=None):
                         "desc": lambda: create_model(
                             input_ch=3, nr_types=nr_type, 
                             freeze=True, mode=mode,
-                            rec_model=rec_model
+                            rec_model=rec_model,
+                            net_channels=net_channels,
                         ),
                         "optimizer": [
                             optim.Adam,
@@ -69,7 +70,8 @@ def get_config(nr_type, mode, rec_model=None, pretrained_model_filename=None):
                         "desc": lambda: create_model(
                             input_ch=3, nr_types=nr_type, 
                             freeze=False, mode=mode,
-                            rec_model=rec_model
+                            rec_model=rec_model,
+                            net_channels=net_channels,
                         ),
                         "optimizer": [
                             optim.Adam,

@@ -56,8 +56,13 @@ class TrainManager(Config):
         return
 
     def _override_config(self, config_file=None):
-        if config_file is None or not os.path.isfile(config_file):
+        if config_file is None:
             return
+
+        elif config_file is not None:
+            assert os.path.isfile(config_file), ("The configuration file "
+                                                 f"`[config_file]` does not "
+                                                 "exist")
 
         with open(config_file, mode="r") as fp:
             config_parameters = json.load(fp)
