@@ -22,7 +22,7 @@ from .._autoencoders import Synthesizer
 
 # TODO: training config only ?
 # TODO: switch all to function name String for all option
-def get_config(nr_type, mode, rec_model=None):
+def get_config(nr_type, mode, rec_model=None, pretrained_model_filename=None):
     return {
         # ------------------------------------------------------------------
         # ! All phases have the same number of run engine
@@ -55,8 +55,7 @@ def get_config(nr_type, mode, rec_model=None):
                         },
                         # path to load, -1 to auto load checkpoint from previous phase,
                         # None to start from scratch
-                        # "pretrained": "../pretrained/ImageNet-ResNet50-Preact_pytorch.tar",
-                        "pretrained": None,
+                        "pretrained": pretrained_model_filename,
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},

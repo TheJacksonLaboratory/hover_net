@@ -41,6 +41,7 @@ class Config(object):
         self.log_dir = "/mnt/logs" # where checkpoints will be saved
 
         self.rec_model_path = None
+        self.pretrained_model_filename = None
 
         # paths to training and validation patches
         self.train_dir_list = []
@@ -75,7 +76,10 @@ class Config(object):
         module = importlib.import_module(
             "models.%s.opt" % self.model_name
         )
-        self.model_config = module.get_config(self.nr_type, self.model_mode, rec_model=rec_model)
+
+        self.model_config = module.get_config(
+            self.nr_type, self.model_mode, rec_mode=rec_model,
+            pretrained_model_filename=self.pretrained_model_filename)
 
         # * parsing config to the running state and set up associated variables
         self.dataset = get_dataset(self.dataset_name)
