@@ -42,7 +42,7 @@ class Config(object):
 
         self.rec_model_path = None
         self.pretrained_model_filename = None
-        net_channels = None
+        self.epochs = [50, 50]
 
         # paths to training and validation patches
         self.train_dir_list = []
@@ -81,7 +81,8 @@ class Config(object):
         self.model_config = module.get_config(
             self.nr_type, self.model_mode, rec_model=rec_model,
             pretrained_model_filename=self.pretrained_model_filename,
-            net_channels=self.net_channels)
+            net_channels=self.net_channels,
+            epochs=self.epochs)
 
         # * parsing config to the running state and set up associated variables
         self.dataset = get_dataset(self.dataset_name)

@@ -128,7 +128,7 @@ def get_augmentation(input_shape, mode, rng, compressed_input=False):
                 translate_percent={"x": (-0.01, 0.01), "y": (-0.01, 0.01)},
                 shear=(-5, 5),  # shear by -5 to +5 degrees
                 rotate=(-179, 179),  # rotate by -179 to +179 degrees
-                order=0,  # use nearest neighbour
+                order=4,  # use nearest neighbour
                 backend="cv2",  # opencv for fast processing
                 seed=rng,
             ),
@@ -141,7 +141,10 @@ def get_augmentation(input_shape, mode, rng, compressed_input=False):
             iaa.Flipud(0.5, seed=rng),
         ]
         if compressed_input:
-            input_augs = []
+            input_augs = [
+                iaa.AdditiveGaussianNoise(loc=0, scale=(0.0, 0.005 * 255),
+                                          per_channel=0.5)]
+                    
         else:
             input_augs = [
                 iaa.OneOf(
