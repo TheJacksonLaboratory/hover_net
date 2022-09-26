@@ -129,7 +129,7 @@ def get_augmentation(input_shape, mode, rng, compressed_input=False):
                 shear=(-5, 5),  # shear by -5 to +5 degrees
                 rotate=(-179, 179),  # rotate by -179 to +179 degrees
                 order=4,  # use nearest neighbour
-                backend="cv2",  # opencv for fast processing
+                backend="skimage",  # opencv for fast processing
                 seed=rng,
             ),
             # set position to 'center' for center crop
