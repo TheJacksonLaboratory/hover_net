@@ -637,9 +637,11 @@ class LabeledZarrDataset(ZarrDataset):
         ann = np.moveaxis(ann, 0, -1).astype("int32")
 
         if self.shape_augs is not None:
-            shape_augs = self.shape_augs.to_deterministic()
-            img = shape_augs.augment_image(img)
-            ann = shape_augs.augment_image(ann)
+            shape_augs_img = self.shape_augs[0].to_deterministic()
+            shape_augs_ann = self.shape_augs[1].to_deterministic()
+            shape_augs_ann.copy_random_state_(shape_augs_img)
+            img = shape_augs_img.augment_image(img)
+            ann = shape_augs_ann.augment_image(ann)
 
         if self.input_augs is not None:
             input_augs = self.input_augs.to_deterministic()
@@ -666,7 +668,8 @@ class LabeledZarrDataset(ZarrDataset):
         self.augmentor = get_augmentation(self.input_shape, self._data_mode,
                                           seed,
                                           self._compressed_input)
-        self.shape_augs = iaa.Sequential(self.augmentor[0])
+        self.shape_augs = (iaa.Sequential(self.augmentor[0][0]),
+                           iaa.Sequential(self.augmentor[0][1]))
         self.input_augs = iaa.Sequential(self.augmentor[1])
         self.id = self.id + worker_id
         return
