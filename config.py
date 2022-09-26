@@ -42,6 +42,7 @@ class Config(object):
 
         self.rec_model_path = None
         self.pretrained_model_filename = None
+        self.net_channels = None
         self.epochs = [50, 50]
 
         # paths to training and validation patches
