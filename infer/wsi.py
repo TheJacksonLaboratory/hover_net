@@ -307,14 +307,16 @@ class InferManager(base.InferManager):
             if self.method['compressed_input']:
                 comp_metadata = self.wsi_handler.file_ptr['compressed'].attrs['compression_metadata']
                 compression_level = comp_metadata['compression_level']
+                padding = 1
             else:
                 compression_level = 0
+                padding = 8
 
             dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
                                   patch_size=self.patch_input_shape[0],
                                   dataset_size=-1,
                                   data_mode='all',
-                                  padding=None,
+                                  padding=padding,
                                   stride=self.patch_output_shape[0],
                                   transform=None,
                                   source_format='zarr',

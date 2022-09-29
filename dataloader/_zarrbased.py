@@ -381,7 +381,7 @@ class ZarrDataset(Dataset):
         else:
             self._z_list = None
             self._rois_list = None
-            self._compression_level= None
+            self._compression_level = None
             self._max_H = None
             self._max_W = None
             self._org_channels = None
