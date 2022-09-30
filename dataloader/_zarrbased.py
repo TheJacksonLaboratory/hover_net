@@ -246,7 +246,8 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     # TODO extract this information from the zarr metadata. For now, the color
     # channel is considered to be in the second axis.
     c = z.shape[1 if z.ndim > 3 else 0]
-    H, W = shape[-2:]
+    true_shape = z.shape[-2:]
+    H, W = list(map(min, shape[-2:], true_shape))
 
     tl_x_padding = tl_x - padding[0]
     br_x_padding = tl_x + patch_size + padding[1]
@@ -257,34 +258,44 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     tl_x = max(tl_x_padding, 0) // 2 ** compression_level
     br_y = min(br_y_padding, H) // 2 ** compression_level
     br_x = min(br_x_padding, W) // 2 ** compression_level
-    tl_x_padding //= 2 ** compression_level
-    br_x_padding //= 2 ** compression_level
-    tl_y_padding //= 2 ** compression_level
-    br_y_padding //= 2 ** compression_level
 
     patch = z[..., tl_y:br_y, tl_x:br_x].squeeze()
 
     if c == 1:
         patch = patch[np.newaxis, ...]
 
-    # In the case that the input patch contains more than three dimensions, pad
-    # the leading dimensions with (0, 0).
-    leading_padding = [(0, 0)] * (patch.ndim - 2)
-
     # Pad the patch using the symmetric mode
-    if (patch.shape[-2] < patch_size // 2 ** compression_level
-       or patch.shape[-1] < patch_size // 2 ** compression_level):
-        pad_up = tl_y - tl_y_padding
-        pad_down = br_y_padding - br_y
-        pad_left = tl_x - tl_x_padding
-        pad_right = br_x_padding - br_x
+    patch_size //= 2 ** compression_level
+    if patch.shape[-2] < patch_size or patch.shape[-1] < patch_size:
+        # In the case that the input patch contains more than three dimensions,
+        # pad the leading dimensions with (0, 0).
+        leading_padding = [(0, 0)] * (patch.ndim - 2)
 
-        patch = np.pad(patch,
-                       (*leading_padding,
-                        (pad_up, pad_down),
-                        (pad_left, pad_right)),
-                       mode='symmetric',
+        cp_left = padding[0] if tl_x_padding < 0 else 0
+        cp_right = padding[1] if br_x_padding > W else 0
+        cp_up = padding[2] if tl_y_padding < 0 else 0
+        cp_down = padding[3] if tl_y_padding < 0 else 0
+
+        cp_left //= 2 ** compression_level
+        cp_right //= 2 ** compression_level
+        cp_up //= 2 ** compression_level
+        cp_down //= 2 ** compression_level
+
+        context_padding = (
+            *leading_padding,
+            (cp_up, cp_down),
+            (cp_left, cp_right)
+        )
+
+        filling_padding = (
+            *leading_padding,
+            (0, patch_size - cp_up - cp_down - br_y + tl_y),
+            (0, patch_size - cp_left - cp_right - br_x + tl_x)
+        )
+
+        patch = np.pad(patch, context_padding, mode='symmetric',
                        reflect_type='even')
+        patch = np.pad(patch, filling_padding, mode='mean')
 
     return patch
 
