@@ -505,8 +505,8 @@ class ZarrDataset(Dataset):
         return z_list, rois_list, compression_level
 
     def _compute_size(self, z_list, rois_list):
-        imgs_shapes = [((roi[-2].stop - roi[-2].start)//roi[-2].step,
-                        (roi[-1].stop - roi[-1].start)//roi[-1].step)
+        imgs_shapes = [(max(self._patch_size, roi[-2].stop - roi[-2].start)//roi[-2].step,
+                        max(self._patch_size, roi[-1].stop - roi[-1].start)//roi[-1].step)
                        for _, roi in rois_list]
         imgs_sizes = np.cumsum([0]
                                + [compute_num_patches(W, self._patch_size,

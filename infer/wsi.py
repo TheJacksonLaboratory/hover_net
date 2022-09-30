@@ -172,6 +172,10 @@ def _get_chunk_patch_info(
         patch_output_shape: output patch shape
 
     """
+    # If the input image is smaller than the patch size, consider as if that
+    # was of the patch size instead
+    img_shape = list(map(max, img_shape, patch_input_shape))
+
     round_to_multiple = lambda x, y: np.floor(x / y) * y
     patch_diff_shape = patch_input_shape - patch_output_shape
 
@@ -307,16 +311,14 @@ class InferManager(base.InferManager):
             if self.method['compressed_input']:
                 comp_metadata = self.wsi_handler.file_ptr['compressed'].attrs['compression_metadata']
                 compression_level = comp_metadata['compression_level']
-                padding = 1
             else:
                 compression_level = 0
-                padding = 8
 
             dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
                                   patch_size=self.patch_input_shape[0],
                                   dataset_size=-1,
                                   data_mode='all',
-                                  padding=padding,
+                                  padding=None,
                                   stride=self.patch_output_shape[0],
                                   transform=None,
                                   source_format='zarr',
@@ -560,6 +562,10 @@ class InferManager(base.InferManager):
         start = time.perf_counter()
         self.wsi_handler = get_file_handler(wsi_path, backend=wsi_ext, data_group=self.method['data_group'])
         self.wsi_proc_shape = self.wsi_handler.get_dimensions(self.proc_mag)
+
+        # If the input image is smaller than the patch size, consider as if
+        # that was of the patch size instead
+        self.wsi_proc_shape = list(map(max, self.wsi_proc_shape, patch_input_shape))
         self.wsi_handler.prepare_reading(
             read_mag=self.proc_mag, cache_path="%s/src_wsi.npy" % self.cache_path
         )
