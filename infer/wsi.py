@@ -1,4 +1,3 @@
-from bz2 import compress
 import multiprocessing as mp
 from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, as_completed, wait
 from multiprocessing import Lock, Pool
@@ -22,8 +21,6 @@ from importlib import import_module
 import cv2
 import numpy as np
 import zarr
-import dask
-import dask.array as da
 from numcodecs import Blosc
 import psutil
 import scipy.io as sio
