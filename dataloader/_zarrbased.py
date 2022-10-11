@@ -295,7 +295,7 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
 
         patch = np.pad(patch, context_padding, mode='symmetric',
                        reflect_type='even')
-        patch = np.pad(patch, filling_padding, mode='mean')
+        patch = np.pad(patch, filling_padding, mode='constant')
 
     return patch
 
