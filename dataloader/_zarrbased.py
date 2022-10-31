@@ -211,7 +211,7 @@ def compute_grid(index, imgs_shapes, imgs_sizes, patch_size, padding, stride,
     return i, tl_y, tl_x
 
 
-def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
+def get_patch(z, roi, shape, tl_y, tl_x, patch_size, padding, stride,
               compression_level=0):
     """Get a squared region from an array z (numpy or zarr).
 
@@ -245,7 +245,11 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
 
     # TODO extract this information from the zarr metadata. For now, the color
     # channel is considered to be in the second axis.
-    c = z.shape[1 if z.ndim > 3 else 0]
+    if z.ndim > 3:
+        c = (roi[1].stop - roi[1].start) // roi[1].step
+    else:
+        c = (roi[0].stop - roi[0].start) // roi[0].step
+
     true_shape = z.shape[-2:]
     H, W = list(map(min, shape[-2:], true_shape))
 
@@ -259,7 +263,11 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     br_y = min(br_y_padding, H) // 2 ** compression_level
     br_x = min(br_x_padding, W) // 2 ** compression_level
 
-    patch = z[..., tl_y:br_y, tl_x:br_x].squeeze()
+    roi_patch = [slice(None), slice(None), slice(None)]
+    roi_patch.append(slice(roi[-2].start+tl_y, roi[-2].start+br_y, 1))
+    roi_patch.append(slice(roi[-1].start+tl_y, roi[-1].start+br_y, 1))
+
+    patch = z[tuple(roi_patch)].squeeze()
 
     if c == 1:
         patch = patch[np.newaxis, ...]
@@ -309,7 +317,10 @@ def zarrdataset_worker_init(worker_id):
     if len(filenames_rois) > 1 and len(filenames_rois) >= worker_info.num_workers:
         num_files_per_worker = int(math.ceil(len(filenames_rois) / worker_info.num_workers))
         curr_worker_filenames = dataset_obj._filenames[worker_id*num_files_per_worker:(worker_id+1)*num_files_per_worker]
-        curr_worker_rois = None
+        if dataset_obj is not None:
+            curr_worker_rois = dataset_obj._rois[worker_id*num_files_per_worker:(worker_id+1)*num_files_per_worker]
+        else:
+            curr_worker_rois = None
     elif len(filenames_rois) == 1 and len(filenames_rois[0][1]) >= worker_info.num_workers:
         num_files_per_worker = int(math.ceil(len(filenames_rois[0][1]) / worker_info.num_workers))
         curr_worker_filenames = [filenames_rois[0][0]]
@@ -353,6 +364,7 @@ class ZarrDataset(Dataset):
                  compressed_input=False,
                  split_train=0.7,
                  split_val=0.1,
+                 rois=None,
                  **kwargs):
 
         if padding is None:
@@ -385,9 +397,10 @@ class ZarrDataset(Dataset):
         self._requires_split = False
 
         self._filenames = self._split_dataset(root)
+        self._rois = rois
 
         if workers == 0:
-            self._z_list, self._rois_list, self._compression_level = self._preload_files(self._filenames, data_group=self._data_group, data_axes=self._data_axes)
+            self._z_list, self._rois_list, self._compression_level = self._preload_files(self._filenames, data_group=self._data_group, data_axes=self._data_axes, rois=self._rois)
             dataset_size, self._max_H, self._max_W, self._org_channels, self._imgs_sizes, self._imgs_shapes = self._compute_size(self._z_list, self._rois_list)
         else:
             self._z_list = None
@@ -557,7 +570,8 @@ class ZarrDataset(Dataset):
                                      self._stride,
                                      self._by_rows)
         id, roi = self._rois_list[i]
-        patch = get_patch(self._z_list[id].get_orthogonal_selection(roi),
+        patch = get_patch(self._z_list[id], 
+                          roi,
                           self._imgs_shapes[id],
                           tl_y,
                           tl_x,
@@ -625,7 +639,8 @@ class LabeledZarrDataset(ZarrDataset):
                                      self._stride,
                                      self._by_rows)
         id, roi = self._rois_list[i]
-        img = get_patch(self._z_list[id].get_orthogonal_selection(roi),
+        img = get_patch(self._z_list[id],
+                        roi,
                         self._imgs_shapes[id],
                         tl_y,
                         tl_x,
@@ -637,7 +652,8 @@ class LabeledZarrDataset(ZarrDataset):
         img = np.moveaxis(img, 0, -1).astype("uint8")
 
         id, roi = self._lab_rois_list[i]
-        ann = get_patch(self._lab_list[id].get_orthogonal_selection(roi),
+        ann = get_patch(self._lab_list[id],
+                        roi,
                         self._imgs_shapes[id],
                         tl_y,
                         tl_x,

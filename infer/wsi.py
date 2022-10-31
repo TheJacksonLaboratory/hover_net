@@ -305,11 +305,16 @@ class InferManager(base.InferManager):
         if (hasattr(self.wsi_handler.file_ptr, 'store')
            and '.zarr' in self.wsi_handler.file_ptr.store.path):
             # Check whether the input data is compressed or not.
-            if self.method['compressed_input']:
-                comp_metadata = self.wsi_handler.file_ptr['compressed'].attrs['compression_metadata']
-                compression_level = comp_metadata['compression_level']
-            else:
-                compression_level = 0
+            compression_level = 0
+            curr_roi = ((patch_top_left_list[0, 0], patch_top_left_list[0, 1],
+                         0,
+                         0,
+                         0),
+                        (self.patch_input_shape[0] + patch_top_left_list[-1, 0],
+                         self.patch_input_shape[1] + patch_top_left_list[-1, 1],
+                         1,
+                         3,
+                         1))
 
             dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
                                   patch_size=self.patch_input_shape[0],
@@ -324,7 +329,8 @@ class InferManager(base.InferManager):
                                   data_group=self.method['data_group'] + '/0',
                                   by_rows=False,
                                   compression_level=compression_level,
-                                  compressed_input=self.method['compressed_input'])
+                                  compressed_input=self.method['compressed_input'],
+                                  rois=[[curr_roi]])
         else:
             dataset = SerializeArray(
                 "%s/cache_chunk.npy" % self.cache_path,
@@ -359,14 +365,17 @@ class InferManager(base.InferManager):
             sample_info_list = np.split(sample_info_list, curr_batch_size, axis=0)
 
             if isinstance(self.wsi_pred_map, zarr.Array):
+                # If the input image is already in zarr format, store the
+                # prediction map in a Zarr file instead of saving it for
+                # constructing the map later
                 offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
                 for pos, pred in zip(sample_info_list, sample_output_list):
                     self.wsi_pred_map[0, :, 0,
-                                      offset + pos[0, 0]:offset + pos[0, 0] + pred.shape[1],
-                                      offset + pos[0, 1]:offset + pos[0, 1] + pred.shape[2]] = \
+                                      patch_top_left_list[0, 0] + offset + pos[0, 0]:offset + pos[0, 0] + pred.shape[1],
+                                      patch_top_left_list[0, 1] + offset + pos[0, 1]:offset + pos[0, 1] + pred.shape[2]] = \
                                         pred[0].transpose(2, 0, 1)
             else:
-                sample_output_list = list(zip(sample_info_list, sample_output_list))     
+                sample_output_list = list(zip(sample_info_list, sample_output_list))
                 accumulated_patch_output.extend(sample_output_list)
 
             pbar.update()
@@ -430,18 +439,20 @@ class InferManager(base.InferManager):
 
             # there no valid patches, so flush 0 and skip
             if chunk_patch_info_list.shape[0] == 0:
-                proc_pool.apply_async(
-                    _assemble_and_flush,
-                    args=("%s/pred_map.npy" % self.cache_path,
-                          chunk_info,
-                          None)
-                )
+                if not (hasattr(self.wsi_handler.file_ptr, 'store')
+                        and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                    proc_pool.apply_async(
+                        _assemble_and_flush,
+                        args=("%s/pred_map.npy" % self.cache_path,
+                            chunk_info,
+                            None)
+                    )
                 continue
 
             # shift the coordinare from wrt slide to wrt chunk
             chunk_patch_info_list -= chunk_info[:, 0]
-            if not ((hasattr(self.wsi_handler.file_ptr, 'store')
-                    and '.zarr' in self.wsi_handler.file_ptr.store.path)):
+            if not (hasattr(self.wsi_handler.file_ptr, 'store')
+                    and '.zarr' in self.wsi_handler.file_ptr.store.path):
                 chunk_data = self.wsi_handler.read_region(
                     chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
                 )
@@ -453,6 +464,8 @@ class InferManager(base.InferManager):
                 chunk_patch_info_list[:, 0, 0], pbar_desc
             )
 
+            # When using Zarr to store the prediction map, it is not needed to
+            # assemble it since the map is generated at inference time
             if not (hasattr(self.wsi_handler.file_ptr, 'store')
                    and '.zarr' in self.wsi_handler.file_ptr.store.path):
                 proc_pool.apply_async(
