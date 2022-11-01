@@ -29,7 +29,7 @@ from skimage import morphology
 import torch.utils.data as data
 from torchvision import transforms
 import tqdm
-from dataloader.infer_loader import SerializeArray, SerializeFileList
+from dataloader.infer_loader import SerializeArray, SerializeZarrArray, SerializeFileList
 from dataloader import ZarrDataset
 from docopt import docopt
 from misc.utils import (
@@ -304,33 +304,12 @@ class InferManager(base.InferManager):
         # TODO: the cost of creating dataloader may not be cheap ?
         if (hasattr(self.wsi_handler.file_ptr, 'store')
            and '.zarr' in self.wsi_handler.file_ptr.store.path):
-            # Check whether the input data is compressed or not.
-            compression_level = 0
-            curr_roi = ((patch_top_left_list[0, 0], patch_top_left_list[0, 1],
-                         0,
-                         0,
-                         0),
-                        (self.patch_input_shape[0] + patch_top_left_list[-1, 0],
-                         self.patch_input_shape[1] + patch_top_left_list[-1, 1],
-                         1,
-                         3,
-                         1))
-
-            dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
-                                  patch_size=self.patch_input_shape[0],
-                                  dataset_size=-1,
-                                  data_mode='all',
-                                  padding=None,
-                                  stride=self.patch_output_shape[0],
-                                  transform=None,
-                                  source_format='zarr',
-                                  workers=0,
-                                  data_axes='TCZYX',
-                                  data_group=self.method['data_group'] + '/0',
-                                  by_rows=False,
-                                  compression_level=compression_level,
-                                  compressed_input=self.method['compressed_input'],
-                                  rois=[[curr_roi]])
+            dataset = SerializeZarrArray(
+                self.wsi_handler.file_ptr[self.method['data_group'] + '/0'],
+                self.cached_pos,
+                patch_top_left_list,
+                self.patch_input_shape,
+            )
         else:
             dataset = SerializeArray(
                 "%s/cache_chunk.npy" % self.cache_path,
@@ -371,8 +350,8 @@ class InferManager(base.InferManager):
                 offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
                 for pos, pred in zip(sample_info_list, sample_output_list):
                     self.wsi_pred_map[0, :, 0,
-                                      patch_top_left_list[0, 0] + offset + pos[0, 0]:offset + pos[0, 0] + pred.shape[1],
-                                      patch_top_left_list[0, 1] + offset + pos[0, 1]:offset + pos[0, 1] + pred.shape[2]] = \
+                                      self.cached_pos[0] + pos[0, 0] + offset:self.cached_pos[0] + pos[0, 0] + offset + pred.shape[1],
+                                      self.cached_pos[1] + pos[0, 1] + offset:self.cached_pos[1] + pos[0, 1] + offset + pred.shape[2]] = \
                                         pred[0].transpose(2, 0, 1)
             else:
                 sample_output_list = list(zip(sample_info_list, sample_output_list))
@@ -449,10 +428,13 @@ class InferManager(base.InferManager):
                     )
                 continue
 
-            # shift the coordinare from wrt slide to wrt chunk
             chunk_patch_info_list -= chunk_info[:, 0]
-            if not (hasattr(self.wsi_handler.file_ptr, 'store')
-                    and '.zarr' in self.wsi_handler.file_ptr.store.path):
+            # shift the coordinare from wrt slide to wrt chunk
+            if (hasattr(self.wsi_handler.file_ptr, 'store')
+               and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                self.cached_pos = chunk_info[0][0]
+                self.cached_size = chunk_info[0][1] - chunk_info[0][0]
+            else:
                 chunk_data = self.wsi_handler.read_region(
                     chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
                 )
@@ -603,11 +585,7 @@ class InferManager(base.InferManager):
                 mask = morphology.binary_dilation(mask, morphology.disk(16))
                 return mask
 
-            if ((hasattr(self.wsi_handler.file_ptr, 'store')
-               and '.zarr' in self.wsi_handler.file_ptr.store.path)):
-                self.wsi_mask = np.ones(self.wsi_proc_shape, dtype=np.uint8)
-            else:
-                self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
+            self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
 
         if np.sum(self.wsi_mask) == 0:
             log_info("Skip due to empty mask!")
