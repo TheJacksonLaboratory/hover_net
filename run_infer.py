@@ -57,7 +57,7 @@ usage:
     wsi (--input_dir=<path>) (--output_dir=<path>) [--proc_mag=<n>]\
         [--cache_path=<path>] [--input_mask_dir=<path>] \
         [--ambiguous_size=<n>] [--chunk_shape=<n>] [--tile_shape=<n>] \
-        [--save_thumb] [--save_mask]
+        [--save_thumb] [--save_mask] [--keep_maps]
     
 options:
     --input_dir=<path>      Path to input data directory. Assumes the files are not nested within directory.
@@ -69,9 +69,10 @@ options:
     --proc_mag=<n>          Magnification level (objective power) used for WSI processing. [default: 40]
     --ambiguous_size=<int>  Define ambiguous region along tiling grid to perform re-post processing. [default: 128]
     --chunk_shape=<n>       Shape of chunk for processing. [default: 10000]
-    --tile_shape=<n>        Shape of tiles for processing. [default: 512]
+    --tile_shape=<n>        Shape of tiles for processing. [default: 2048]
     --save_thumb            To save thumb. [default: False]
     --save_mask             To save mask. [default: False]
+    --keep_maps             To keep the prediction maps or not. [default: False]
 """
 
 import torch
@@ -148,8 +149,8 @@ if __name__ == '__main__':
     }
 
     if args['model_mode'] in ['fast', 'compressed_rec']:
-        run_args['patch_input_shape'] = 256
-        run_args['patch_output_shape'] = 164
+        run_args['patch_input_shape'] = 512 # 256
+        run_args['patch_output_shape'] = 512 - 92 # 164
     else:
         run_args['patch_input_shape'] = 270
         run_args['patch_output_shape'] = 80
@@ -178,6 +179,7 @@ if __name__ == '__main__':
             'tile_shape'     : int(sub_args['tile_shape']),
             'save_thumb'     : sub_args['save_thumb'],
             'save_mask'      : sub_args['save_mask'],
+            'keep_maps'      : sub_args['keep_maps'],
         })
     # ***
 

@@ -868,8 +868,9 @@ class InferManager(base.InferManager):
                 logging.exception("Crash")
 
             wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
-            source = zarr.open(wsi_pred_map_mmap_path, mode="r")
-            dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
-            zarr.copy(source, dest_group, '0')
-        # rm_n_mkdir(self.cache_path)  # clean up all cache
+            if self.keep_maps and os.path.isdir(wsi_pred_map_mmap_path):
+                source = zarr.open(wsi_pred_map_mmap_path, mode="r")
+                dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
+                zarr.copy(source, dest_group, '0')
+        rm_n_mkdir(self.cache_path)  # clean up all cache
         return
