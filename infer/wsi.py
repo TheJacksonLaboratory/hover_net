@@ -865,12 +865,25 @@ class InferManager(base.InferManager):
                 self.process_single_file(wsi_path, msk_path, self.output_dir)
                 log_info("Finish")
             except:
-                logging.exception("Crash")
+               logging.exception("Crash")
 
-            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
-            if self.keep_maps and os.path.isdir(wsi_pred_map_mmap_path):
-                source = zarr.open(wsi_pred_map_mmap_path, mode="r")
-                dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
-                zarr.copy(source, dest_group, '0')
-        rm_n_mkdir(self.cache_path)  # clean up all cache
+            if (hasattr(self.wsi_handler.file_ptr, 'store')
+              and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+                if self.keep_maps and os.path.isdir(wsi_pred_map_mmap_path):
+                    source = zarr.open(wsi_pred_map_mmap_path, mode="r")
+                    dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
+                    zarr.copy(source, dest_group, '0')
+
+        if self.cache_path != self.output_dir:
+            rm_n_mkdir(self.cache_path)  # clean up all cache
+        else:
+            if os.path.isdir("%s/pred_map.zarr" % self.cache_path):
+                shutil.rmtree("%s/pred_map.zarr" % self.cache_path, True)
+            if os.path.isdir("%s/pred_inst.zarr" % self.cache_path):
+                shutil.rmtree("%s/pred_inst.zarr" % self.cache_path, True)
+            if os.path.isfile("%s/pred_map.npy" % self.cache_path):
+                os.remove("%s/pred_map.npy" % self.cache_path)
+            if os.path.isfile("%s/pred_inst.npy" % self.cache_path):
+                os.remove("%s/pred_inst.npy" % self.cache_path)
         return

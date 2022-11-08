@@ -149,8 +149,8 @@ if __name__ == '__main__':
     }
 
     if args['model_mode'] in ['fast', 'compressed_rec']:
-        run_args['patch_input_shape'] = 512 # 256
-        run_args['patch_output_shape'] = 512 - 92 # 164
+        run_args['patch_input_shape'] = 256
+        run_args['patch_output_shape'] = 164
     else:
         run_args['patch_input_shape'] = 270
         run_args['patch_output_shape'] = 80
