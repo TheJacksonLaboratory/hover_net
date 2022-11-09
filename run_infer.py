@@ -23,6 +23,7 @@ Options:
   --nr_inference_workers=<n>  Number of workers during inference. [default: 8]
   --nr_post_proc_workers=<n>  Number of workers during post-processing. [default: 16]
   --batch_size=<n>            Batch size per 1 GPU. [default: 32]
+  --patch_input_size=<n>      Size of the patches feed to the neural network. [default: 256]
 
 Two command mode are `tile` and `wsi` to enter corresponding inference mode
     tile  run the inference on tile
@@ -149,8 +150,8 @@ if __name__ == '__main__':
     }
 
     if args['model_mode'] in ['fast', 'compressed_rec']:
-        run_args['patch_input_shape'] = 256
-        run_args['patch_output_shape'] = 164
+        run_args['patch_input_shape'] = int(args['patch_input_size']) # 256
+        run_args['patch_output_shape'] = int(args['patch_input_size']) - 92 # 164
     else:
         run_args['patch_input_shape'] = 270
         run_args['patch_output_shape'] = 80

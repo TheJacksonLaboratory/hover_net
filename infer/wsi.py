@@ -349,10 +349,16 @@ class InferManager(base.InferManager):
                 # constructing the map later
                 offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
                 for pos, pred in zip(sample_info_list, sample_output_list):
-                    self.wsi_pred_map[0, :, 0,
-                                      self.cached_pos[0] + pos[0, 0] + offset:self.cached_pos[0] + pos[0, 0] + offset + pred.shape[1],
-                                      self.cached_pos[1] + pos[0, 1] + offset:self.cached_pos[1] + pos[0, 1] + offset + pred.shape[2]] = \
-                                        pred[0].transpose(2, 0, 1)
+                    tl_x_dst = self.cached_pos[1] + pos[0, 1] + offset
+                    tl_y_dst = self.cached_pos[0] + pos[0, 0] + offset
+                    br_x_dst = min(self.wsi_pred_map.shape[4], self.cached_pos[1] + pos[0, 1] + offset + pred.shape[2])
+                    br_y_dst = min(self.wsi_pred_map.shape[3], self.cached_pos[0] + pos[0, 0] + offset + pred.shape[1])
+
+                    br_x_src = br_x_dst - tl_x_dst
+                    br_y_src = br_y_dst - tl_y_dst
+
+                    self.wsi_pred_map[0, :, 0, tl_y_dst:br_y_dst, tl_x_dst:br_x_dst] = \
+                        pred[0, :br_y_src, :br_x_src, :].transpose(2, 0, 1)
             else:
                 sample_output_list = list(zip(sample_info_list, sample_output_list))
                 accumulated_patch_output.extend(sample_output_list)

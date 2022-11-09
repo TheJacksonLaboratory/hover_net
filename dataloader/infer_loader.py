@@ -124,6 +124,16 @@ class SerializeZarrArray(data.Dataset):
             self.cached_pos[0] + patch_info[0] : self.cached_pos[0] + patch_info[0] + self.patch_size[0],
             self.cached_pos[1] + patch_info[1] : self.cached_pos[1] + patch_info[1] + self.patch_size[1],
         ], 0, -1)
+        if patch_data.shape[0] < self.patch_size[0] or patch_data.shape[1] < self.patch_size[1]:
+            # Pad each axis and add a padding of shape 0 for the color channel
+            paddings = [
+                (0, self.patch_size[0] - patch_data.shape[0]),
+                (0, self.patch_size[1] - patch_data.shape[1]),
+                (0, 0)
+            ]
+
+            patch_data = np.pad(patch_data, paddings, mode='constant')
+
         if self.preproc is not None:
             patch_data = self.preproc(patch_data)
         return patch_data, patch_info
