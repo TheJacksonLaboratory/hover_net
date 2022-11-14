@@ -22,7 +22,12 @@ from .._autoencoders import Synthesizer
 
 # TODO: training config only ?
 # TODO: switch all to function name String for all option
-def get_config(nr_type, mode, rec_model=None):
+def get_config(nr_type, mode, net_channels=None, rec_model=None,
+               pretrained_model_filename=None,
+               epochs=None):
+    if epochs is None:
+        epochs = [50, 50]
+
     return {
         # ------------------------------------------------------------------
         # ! All phases have the same number of run engine
@@ -33,9 +38,10 @@ def get_config(nr_type, mode, rec_model=None):
                     # may need more dynamic for each network
                     "net": {
                         "desc": lambda: create_model(
-                            input_ch=3, nr_types=nr_type, 
+                            input_ch=3, nr_types=nr_type,
                             freeze=True, mode=mode,
-                            rec_model=rec_model
+                            rec_model=rec_model,
+                            net_channels=net_channels,
                         ),
                         "optimizer": [
                             optim.Adam,
@@ -55,13 +61,12 @@ def get_config(nr_type, mode, rec_model=None):
                         },
                         # path to load, -1 to auto load checkpoint from previous phase,
                         # None to start from scratch
-                        # "pretrained": "../pretrained/ImageNet-ResNet50-Preact_pytorch.tar",
-                        'pretrained': None,
+                        "pretrained": pretrained_model_filename,
                     },
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
                 "batch_size": {"train": 16, "valid": 16,},  # engine name : value
-                "nr_epochs": 50,
+                "nr_epochs": epochs[0],
             },
             {
                 "run_info": {
@@ -70,7 +75,8 @@ def get_config(nr_type, mode, rec_model=None):
                         "desc": lambda: create_model(
                             input_ch=3, nr_types=nr_type, 
                             freeze=False, mode=mode,
-                            rec_model=rec_model
+                            rec_model=rec_model,
+                            net_channels=net_channels,
                         ),
                         "optimizer": [
                             optim.Adam,
@@ -95,7 +101,7 @@ def get_config(nr_type, mode, rec_model=None):
                 },
                 "target_info": {"gen": (gen_targets, {}), "viz": (prep_sample, {})},
                 "batch_size": {"train": 4, "valid": 8,}, # batch size per gpu
-                "nr_epochs": 50,
+                "nr_epochs": epochs[1],
             },
         ],
         # ------------------------------------------------------------------

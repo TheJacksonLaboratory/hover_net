@@ -98,3 +98,42 @@ class SerializeArray(data.Dataset):
         if self.preproc is not None:
             patch_data = self.preproc(patch_data)
         return patch_data, patch_info
+
+
+####
+class SerializeZarrArray(data.Dataset):
+    def __init__(self, zarray, cached_pos, patch_info_list, patch_size, preproc=None):
+        super().__init__()
+        self.patch_size = patch_size
+
+        # use mmap as intermediate sharing, else variable will be duplicated
+        # accross torch worker => OOM error, open in read only mode
+        self.image = zarray
+
+        self.patch_info_list = patch_info_list
+        self.cached_pos = cached_pos
+        self.preproc = preproc
+        return
+
+    def __len__(self):
+        return len(self.patch_info_list)
+
+    def __getitem__(self, idx):
+        patch_info = self.patch_info_list[idx]
+        patch_data = np.moveaxis(self.image[0, :, 0,
+            self.cached_pos[0] + patch_info[0] : self.cached_pos[0] + patch_info[0] + self.patch_size[0],
+            self.cached_pos[1] + patch_info[1] : self.cached_pos[1] + patch_info[1] + self.patch_size[1],
+        ], 0, -1)
+        if patch_data.shape[0] < self.patch_size[0] or patch_data.shape[1] < self.patch_size[1]:
+            # Pad each axis and add a padding of shape 0 for the color channel
+            paddings = [
+                (0, self.patch_size[0] - patch_data.shape[0]),
+                (0, self.patch_size[1] - patch_data.shape[1]),
+                (0, 0)
+            ]
+
+            patch_data = np.pad(patch_data, paddings, mode='constant')
+
+        if self.preproc is not None:
+            patch_data = self.preproc(patch_data)
+        return patch_data, patch_info

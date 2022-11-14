@@ -3,7 +3,7 @@
 Main HoVer-Net training script.
 
 Usage:
-  run_train.py [--gpu=<id>] [--view=<dset>]
+  run_train.py [--gpu=<id>] [--view=<dset>] [--config_file=<path>]
   run_train.py (-h | --help)
   run_train.py --version
 
@@ -12,6 +12,7 @@ Options:
   --version       Show version.
   --gpu=<id>      Comma separated GPU list. [default: 0,1,2,3]
   --view=<dset>   Visualise images after augmentation. Choose 'train' or 'valid'.
+  --config_file=<path>  Path to configuration file. [default: None]
 """
 
 import cv2
@@ -48,9 +49,26 @@ from run_utils.utils import (
 class TrainManager(Config):
     """Either used to view the dataset or to initialise the main training loop."""
 
-    def __init__(self):
+    def __init__(self, config_file=None):
         super().__init__()
+        self._override_config(config_file)
+        self._validate_config()
         return
+
+    def _override_config(self, config_file=None):
+        if config_file is None:
+            return
+
+        elif config_file is not None:
+            assert os.path.isfile(config_file), ("The configuration file "
+                                                 f"`[config_file]` does not "
+                                                 "exist")
+
+        with open(config_file, mode="r") as fp:
+            config_parameters = json.load(fp)
+
+        for variable, value in config_parameters.items():
+            self.__setattr__(variable, value)
 
     ####
     def view_dataset(self, mode="train"):
@@ -112,6 +130,7 @@ class TrainManager(Config):
         elif '.zarr' in self.src_fmt:
             input_dataset = LabeledZarrDataset(
                 data_dir_list,
+                dataset_size=5000,
                 patch_size=self.aug_shape[0],
                 input_shape=self.shape_info[run_mode]['input_shape'],
                 mask_shape=self.shape_info[run_mode]['mask_shape'],
@@ -308,7 +327,7 @@ class TrainManager(Config):
 ####
 if __name__ == "__main__":
     args = docopt(__doc__, version="HoVer-Net v1.0")
-    trainer = TrainManager()
+    trainer = TrainManager(args["--config_file"])
 
     if args["--view"]:
         if args["--view"] != "train" and args["--view"] != "valid":

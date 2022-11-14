@@ -1,4 +1,3 @@
-from bz2 import compress
 import multiprocessing as mp
 from concurrent.futures import FIRST_EXCEPTION, ProcessPoolExecutor, as_completed, wait
 from multiprocessing import Lock, Pool
@@ -22,8 +21,6 @@ from importlib import import_module
 import cv2
 import numpy as np
 import zarr
-import dask
-import dask.array as da
 from numcodecs import Blosc
 import psutil
 import scipy.io as sio
@@ -32,7 +29,7 @@ from skimage import morphology
 import torch.utils.data as data
 from torchvision import transforms
 import tqdm
-from dataloader.infer_loader import SerializeArray, SerializeFileList
+from dataloader.infer_loader import SerializeArray, SerializeZarrArray, SerializeFileList
 from dataloader import ZarrDataset
 from docopt import docopt
 from misc.utils import (
@@ -172,6 +169,10 @@ def _get_chunk_patch_info(
         patch_output_shape: output patch shape
 
     """
+    # If the input image is smaller than the patch size, consider as if that
+    # was of the patch size instead
+    img_shape = list(map(max, img_shape, patch_input_shape))
+
     round_to_multiple = lambda x, y: np.floor(x / y) * y
     patch_diff_shape = patch_input_shape - patch_output_shape
 
@@ -303,27 +304,12 @@ class InferManager(base.InferManager):
         # TODO: the cost of creating dataloader may not be cheap ?
         if (hasattr(self.wsi_handler.file_ptr, 'store')
            and '.zarr' in self.wsi_handler.file_ptr.store.path):
-            # Check whether the input data is compressed or not.
-            if self.method['compressed_input']:
-                comp_metadata = self.wsi_handler.file_ptr['compressed'].attrs['compression_metadata']
-                compression_level = comp_metadata['compression_level']
-            else:
-                compression_level = 0
-
-            dataset = ZarrDataset(root=self.wsi_handler.file_ptr,
-                                  patch_size=self.patch_input_shape[0],
-                                  dataset_size=-1,
-                                  data_mode='all',
-                                  padding=None,
-                                  stride=self.patch_output_shape[0],
-                                  transform=None,
-                                  source_format='zarr',
-                                  workers=0,
-                                  data_axes='TCZYX',
-                                  data_group=self.method['data_group'] + '/0',
-                                  by_rows=False,
-                                  compression_level=compression_level,
-                                  compressed_input=self.method['compressed_input'])
+            dataset = SerializeZarrArray(
+                self.wsi_handler.file_ptr[self.method['data_group'] + '/0'],
+                self.cached_pos,
+                patch_top_left_list,
+                self.patch_input_shape,
+            )
         else:
             dataset = SerializeArray(
                 "%s/cache_chunk.npy" % self.cache_path,
@@ -358,14 +344,23 @@ class InferManager(base.InferManager):
             sample_info_list = np.split(sample_info_list, curr_batch_size, axis=0)
 
             if isinstance(self.wsi_pred_map, zarr.Array):
+                # If the input image is already in zarr format, store the
+                # prediction map in a Zarr file instead of saving it for
+                # constructing the map later
                 offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
                 for pos, pred in zip(sample_info_list, sample_output_list):
-                    self.wsi_pred_map[0, :, 0,
-                                      offset + pos[0, 0]:offset + pos[0, 0] + pred.shape[1],
-                                      offset + pos[0, 1]:offset + pos[0, 1] + pred.shape[2]] = \
-                                        pred[0].transpose(2, 0, 1)
+                    tl_x_dst = self.cached_pos[1] + pos[0, 1] + offset
+                    tl_y_dst = self.cached_pos[0] + pos[0, 0] + offset
+                    br_x_dst = min(self.wsi_pred_map.shape[4], self.cached_pos[1] + pos[0, 1] + offset + pred.shape[2])
+                    br_y_dst = min(self.wsi_pred_map.shape[3], self.cached_pos[0] + pos[0, 0] + offset + pred.shape[1])
+
+                    br_x_src = br_x_dst - tl_x_dst
+                    br_y_src = br_y_dst - tl_y_dst
+
+                    self.wsi_pred_map[0, :, 0, tl_y_dst:br_y_dst, tl_x_dst:br_x_dst] = \
+                        pred[0, :br_y_src, :br_x_src, :].transpose(2, 0, 1)
             else:
-                sample_output_list = list(zip(sample_info_list, sample_output_list))            
+                sample_output_list = list(zip(sample_info_list, sample_output_list))
                 accumulated_patch_output.extend(sample_output_list)
 
             pbar.update()
@@ -429,18 +424,23 @@ class InferManager(base.InferManager):
 
             # there no valid patches, so flush 0 and skip
             if chunk_patch_info_list.shape[0] == 0:
-                proc_pool.apply_async(
-                    _assemble_and_flush,
-                    args=("%s/pred_map.npy" % self.cache_path,
-                          chunk_info,
-                          None)
-                )
+                if not (hasattr(self.wsi_handler.file_ptr, 'store')
+                        and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                    proc_pool.apply_async(
+                        _assemble_and_flush,
+                        args=("%s/pred_map.npy" % self.cache_path,
+                            chunk_info,
+                            None)
+                    )
                 continue
 
-            # shift the coordinare from wrt slide to wrt chunk
             chunk_patch_info_list -= chunk_info[:, 0]
-            if not ((hasattr(self.wsi_handler.file_ptr, 'store')
-                    and '.zarr' in self.wsi_handler.file_ptr.store.path)):
+            # shift the coordinare from wrt slide to wrt chunk
+            if (hasattr(self.wsi_handler.file_ptr, 'store')
+               and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                self.cached_pos = chunk_info[0][0]
+                self.cached_size = chunk_info[0][1] - chunk_info[0][0]
+            else:
                 chunk_data = self.wsi_handler.read_region(
                     chunk_info[0][0][::-1], (chunk_info[0][1] - chunk_info[0][0])[::-1]
                 )
@@ -452,6 +452,8 @@ class InferManager(base.InferManager):
                 chunk_patch_info_list[:, 0, 0], pbar_desc
             )
 
+            # When using Zarr to store the prediction map, it is not needed to
+            # assemble it since the map is generated at inference time
             if not (hasattr(self.wsi_handler.file_ptr, 'store')
                    and '.zarr' in self.wsi_handler.file_ptr.store.path):
                 proc_pool.apply_async(
@@ -558,6 +560,10 @@ class InferManager(base.InferManager):
         start = time.perf_counter()
         self.wsi_handler = get_file_handler(wsi_path, backend=wsi_ext, data_group=self.method['data_group'])
         self.wsi_proc_shape = self.wsi_handler.get_dimensions(self.proc_mag)
+
+        # If the input image is smaller than the patch size, consider as if
+        # that was of the patch size instead
+        self.wsi_proc_shape = list(map(max, self.wsi_proc_shape, patch_input_shape))
         self.wsi_handler.prepare_reading(
             read_mag=self.proc_mag, cache_path="%s/src_wsi.npy" % self.cache_path
         )
@@ -585,10 +591,8 @@ class InferManager(base.InferManager):
                 mask = morphology.binary_dilation(mask, morphology.disk(16))
                 return mask
 
-            if self.method['compressed_input']:
-                self.wsi_mask = np.ones(self.wsi_proc_shape, dtype=np.uint8)
-            else:
-                self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
+            self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
+
         if np.sum(self.wsi_mask) == 0:
             log_info("Skip due to empty mask!")
             return
@@ -867,6 +871,25 @@ class InferManager(base.InferManager):
                 self.process_single_file(wsi_path, msk_path, self.output_dir)
                 log_info("Finish")
             except:
-                logging.exception("Crash")
-        # rm_n_mkdir(self.cache_path)  # clean up all cache
+               logging.exception("Crash")
+
+            if (hasattr(self.wsi_handler.file_ptr, 'store')
+              and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+                if self.keep_maps and os.path.isdir(wsi_pred_map_mmap_path):
+                    source = zarr.open(wsi_pred_map_mmap_path, mode="r")
+                    dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
+                    zarr.copy(source, dest_group, '0')
+
+        if self.cache_path != self.output_dir:
+            rm_n_mkdir(self.cache_path)  # clean up all cache
+        else:
+            if os.path.isdir("%s/pred_map.zarr" % self.cache_path):
+                shutil.rmtree("%s/pred_map.zarr" % self.cache_path, True)
+            if os.path.isdir("%s/pred_inst.zarr" % self.cache_path):
+                shutil.rmtree("%s/pred_inst.zarr" % self.cache_path, True)
+            if os.path.isfile("%s/pred_map.npy" % self.cache_path):
+                os.remove("%s/pred_map.npy" % self.cache_path)
+            if os.path.isfile("%s/pred_inst.npy" % self.cache_path):
+                os.remove("%s/pred_inst.npy" % self.cache_path)
         return

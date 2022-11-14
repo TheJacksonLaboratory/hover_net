@@ -6,7 +6,7 @@ import os
 import zarr
 import ome_types
 
-
+os.add_dll_directory("C:/Users/cervaf/Documents/Apps/openslide/bin")
 import openslide
 
 
@@ -91,7 +91,7 @@ class FileHandler(object):
                 mag_list = np.sort(mag_list)[::-1]
                 hires_mag = mag_list - read_mag
                 # only use higher mag as base for loading
-                hires_mag = hires_mag[hires_mag > 0]
+                hires_mag = hires_mag[hires_mag > -1e-3]
                 # use the immediate higher to save compuration
                 hires_mag = mag_list[np.argmin(hires_mag)]
                 scale_factor = read_mag / hires_mag
@@ -221,32 +221,23 @@ class ZarrHandler(FileHandler):
             ome_metadata.images[0].pixels.size_y
         ])
 
-        pyr_metadata = list(filter(lambda ann:
-                                   ann.namespace == 'openmicroscopy.org/'
-                                                    'PyramidResolution',
-                                   ome_metadata.structured_annotations))[0]
-        if 'compressed' in self._data_group:
-            pyr_res = [tuple(self.file_ptr[self._data_group + '/' + res_path].shape[-2:])
-                       for res_path in sorted(self.file_ptr[self._data_group]) if res_path != '0']
-        else:
-            pyr_res = [(int(res.value.split(' ')[0]), int(res.value.split(' ')[1]))
-                       for res in pyr_metadata.value.m]
+        # Take the actual groups in the Zarr file as pyramid resolutions
+        pyr_res = [tuple(self.file_ptr[self._data_group + '/' + res_path].shape[-2:])
+                   for res_path in sorted(self.file_ptr[self._data_group]) if res_path != '0']
 
         magnification_level = [nom_mag] + [nom_mag / (base_shape[0] / res[0])
                                            for res in pyr_res]
-
-        # TODO: This is only true for Arperio, might be false for other vendors
-        vendor = ome_metadata.images[0].description.split(' ')[0].lower()
 
         mpp = np.array([
             ome_metadata.images[0].pixels.physical_size_x,
             ome_metadata.images[0].pixels.physical_size_y
         ])
 
+        # Vendor is not used so it iset to None
         metadata = [
             ("available_mag", magnification_level),  # highest to lowest mag
             ("base_mag", magnification_level[0]),
-            ("vendor", vendor),
+            ("vendor", None),
             ("mpp  ", mpp),
             ("base_shape", base_shape),
         ]

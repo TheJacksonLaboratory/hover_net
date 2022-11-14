@@ -150,7 +150,7 @@ class HoVerNet(Net):
 class HoVerNetComp(Net):
     """Initialise HoVer-Net for compressed images."""
 
-    def __init__(self, input_ch=48, nr_types=None, freeze=False, mode='compressed_rec', rec_model=None):
+    def __init__(self, net_channels=128, nr_types=None, freeze=False, mode='compressed_rec', rec_model=None, **kwargs):
         super().__init__()
         self.mode = mode
         self.freeze = freeze
@@ -160,58 +160,35 @@ class HoVerNetComp(Net):
         assert mode == 'compressed_rec', \
                 'Unknown mode `%s` for HoVerNetComp %s. Only support `compressed_rec`.' % mode
 
-        # self.d0 = ProjectionBlock(in_channels=128, out_channels=256,
-        #                           kernel_size=1,
-        #                           stride=1,
-        #                           padding=0,
-        #                           bias=False)
-        # self.d1 = ProjectionBlock(in_channels=128, out_channels=512,
-        #                           kernel_size=1,
-        #                           stride=1,
-        #                           padding=0,
-        #                           bias=False)
-        # self.d2 = ProjectionBlock(in_channels=128,
-        #                           out_channels=1024,
-        #                           kernel_size=1,
-        #                           stride=1,
-        #                           padding=0,
-        #                           bias=False)
-        # self.d3 = ProjectionBlock(in_channels=128,
-        #                           out_channels=1024,
-        #                           kernel_size=1,
-        #                           stride=1,
-        #                           padding=0,
-        #                           bias=False)
-
-        self.d0 = ResidualBlock(128, [1, 3, 1], [64, 64, 256], 3, stride=1)
-        self.d1 = ResidualBlock(128, [1, 3, 1], [128, 128, 512], 4, stride=1)
-        self.d2 = ResidualBlock(128, [1, 3, 1], [256, 256, 1024], 6, stride=1)
-        self.d3 = ResidualBlock(128, [1, 3, 1], [512, 512, 2048], 3, stride=1)
+        self.d0 = ResidualBlock(net_channels, [1, 3, 1], [64, 64, 256], 3, stride=1)
+        self.d1 = ResidualBlock(net_channels, [1, 3, 1], [128, 128, 512], 4, stride=1)
+        self.d2 = ResidualBlock(net_channels, [1, 3, 1], [256, 256, 1024], 6, stride=1)
+        self.d3 = ResidualBlock(net_channels, [1, 3, 1], [512, 512, 2048], 3, stride=1)
 
         self.conv_bot = nn.Conv2d(2048, 1024, 1, stride=1, padding=0, bias=False)
 
         def create_decoder_branch(out_ch=2, ksize=5):
-            module_list = [ 
+            module_list = [
                 ("conva", nn.Conv2d(1024, 256, ksize, stride=1, padding=0, bias=False)),
                 ("dense", DenseBlock(256, [1, ksize], [128, 32], 8, split=4)),
                 ("convf", nn.Conv2d(512, 512, 1, stride=1, padding=0, bias=False),),
             ]
             u3 = nn.Sequential(OrderedDict(module_list))
 
-            module_list = [ 
+            module_list = [
                 ("conva", nn.Conv2d(512, 128, ksize, stride=1, padding=0, bias=False)),
                 ("dense", DenseBlock(128, [1, ksize], [128, 32], 4, split=4)),
                 ("convf", nn.Conv2d(256, 256, 1, stride=1, padding=0, bias=False),),
             ]
             u2 = nn.Sequential(OrderedDict(module_list))
 
-            module_list = [ 
+            module_list = [
                 ("conva/pad", TFSamepaddingLayer(ksize=ksize, stride=1)),
                 ("conva", nn.Conv2d(256, 64, ksize, stride=1, padding=0, bias=False),),
             ]
             u1 = nn.Sequential(OrderedDict(module_list))
 
-            module_list = [ 
+            module_list = [
                 ("bn", nn.BatchNorm2d(64, eps=1e-5)),
                 ("relu", nn.ReLU(inplace=True)),
                 ("conv", nn.Conv2d(64, out_ch, 1, stride=1, padding=0, bias=True),),
@@ -300,9 +277,47 @@ class HoVerNetComp(Net):
 
 
 ####
+class HoVerNetCompProj(HoVerNetComp):
+    """Initialise HoVer-Net for compressed images using a projection method to
+    increase the number of features from the reconstructed image."""
+
+    def __init__(self, input_ch=48, nr_types=None, freeze=False, mode='compressed_rec', rec_model=None):
+        super().__init__()
+
+        # Overwrite the downsampling blocks for projection-based blocks
+        self.d0 = ProjectionBlock(in_channels=128, out_channels=256,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+        self.d1 = ProjectionBlock(in_channels=128, out_channels=512,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+        self.d2 = ProjectionBlock(in_channels=128,
+                                  out_channels=1024,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+        self.d3 = ProjectionBlock(in_channels=128,
+                                  out_channels=2048,
+                                  kernel_size=1,
+                                  stride=1,
+                                  padding=0,
+                                  bias=False)
+
+        # TODO: pytorch still require the channel eventhough its ignored
+        self.weights_init()
+
+
+####
 def create_model(mode=None, **kwargs):
     if mode not in ['original', 'fast', 'compressed_rec']:
         assert "Unknown Model Mode %s" % mode
     if mode == 'compressed_rec':
         return HoVerNetComp(mode=mode, **kwargs)
+    if mode == 'compressed_rec_proj':
+        return HoVerNetCompProj(mode=mode, **kwargs)
     return HoVerNet(mode=mode, **kwargs)

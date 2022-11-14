@@ -15,6 +15,49 @@ from imgaug import augmenters as iaa
 from misc.utils import cropping_center
 
 
+def image_to_zarr(arr_src, patch_size, source_format, data_group,
+                  compressed_input=False):
+    if (isinstance(arr_src, zarr.Group) or (isinstance(arr_src, str)
+       and '.zarr' in source_format)):
+        # If the passed object is a zarr group/file, open it and
+        # extract the level from the specified group.
+        if isinstance(arr_src, str):
+            arr_src = zarr.open(arr_src, mode='r')
+
+        arr = arr_src[data_group]
+        comp_group = data_group.split('/')[0]
+
+        if (compressed_input
+           and comp_group in arr_src.keys()
+           and 'compression_metadata' in arr_src[comp_group].attrs.keys()):
+            comp_metadata = arr_src[comp_group].attrs['compression_metadata']
+            compressed_channels = comp_metadata['compressed_channels']
+            org_H = comp_metadata['height']
+            org_W = comp_metadata['width']
+            compression_level = comp_metadata['compression_level']
+            arr_shape = (1, compressed_channels, 1, org_H, org_W)
+
+        else:
+            compression_level = 0
+            arr_shape = arr.shape
+
+    elif (isinstance(arr_src, str) and '.zarr' not in source_format):
+        # If the input is a path to an image stored in a format
+        # supported by PIL, open it and use it as a numpy array.
+        arr = load_image(arr_src)
+        arr = zarr.array(arr, chunks=(1, arr.shape[1], 1, patch_size,
+                         patch_size))
+        arr_shape = arr.shape
+        compression_level = 0
+    else:
+        # Otherwise, use directly the zarr array
+        arr = arr_src
+        arr_shape = arr.shape
+        compression_level = 0
+
+    return arr, arr_shape, compression_level
+
+
 def compute_num_patches(size, patch_size, padding, stride):
     """Compute the number of valid patches that can be extracted from the
     source image in a certain axis.
@@ -168,7 +211,7 @@ def compute_grid(index, imgs_shapes, imgs_sizes, patch_size, padding, stride,
     return i, tl_y, tl_x
 
 
-def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
+def get_patch(z, roi, shape, tl_y, tl_x, patch_size, padding, stride,
               compression_level=0):
     """Get a squared region from an array z (numpy or zarr).
 
@@ -176,6 +219,8 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     ----------
     z : dask.array.core.Array, numpy.array or zarr.array
         A full array from where to take a patch
+    roi : iterable of slices
+        The active ROI that is used from the array `z`
     shape : tuple of ints
         Shape of the original array. For compressed representation of images,
         the shape of the uncompressed image.
@@ -202,8 +247,13 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
 
     # TODO extract this information from the zarr metadata. For now, the color
     # channel is considered to be in the second axis.
-    c = z.shape[1 if z.ndim > 3 else 0]
-    H, W = shape[-2:]
+    if z.ndim > 3:
+        c = (roi[1].stop - roi[1].start) // roi[1].step
+    else:
+        c = (roi[0].stop - roi[0].start) // roi[0].step
+
+    true_shape = z.shape[-2:]
+    H, W = list(map(min, shape[-2:], true_shape))
 
     tl_x_padding = tl_x - padding[0]
     br_x_padding = tl_x + patch_size + padding[1]
@@ -214,34 +264,48 @@ def get_patch(z, shape, tl_y, tl_x, patch_size, padding, stride,
     tl_x = max(tl_x_padding, 0) // 2 ** compression_level
     br_y = min(br_y_padding, H) // 2 ** compression_level
     br_x = min(br_x_padding, W) // 2 ** compression_level
-    tl_x_padding //= 2 ** compression_level
-    br_x_padding //= 2 ** compression_level
-    tl_y_padding //= 2 ** compression_level
-    br_y_padding //= 2 ** compression_level
 
-    patch = z[..., tl_y:br_y, tl_x:br_x].squeeze()
+    roi_patch = [slice(None), slice(None), slice(None)]
+    roi_patch.append(slice(roi[-2].start+tl_y, roi[-2].start+br_y, 1))
+    roi_patch.append(slice(roi[-1].start+tl_y, roi[-1].start+br_y, 1))
+
+    patch = z[tuple(roi_patch)].squeeze()
 
     if c == 1:
         patch = patch[np.newaxis, ...]
 
-    # In the case that the input patch contains more than three dimensions, pad
-    # the leading dimensions with (0, 0).
-    leading_padding = [(0, 0)] * (patch.ndim - 2)
-
     # Pad the patch using the symmetric mode
-    if (patch.shape[-2] < patch_size // 2 ** compression_level
-       or patch.shape[-1] < patch_size // 2 ** compression_level):
-        pad_up = tl_y - tl_y_padding
-        pad_down = br_y_padding - br_y
-        pad_left = tl_x - tl_x_padding
-        pad_right = br_x_padding - br_x
+    patch_size //= 2 ** compression_level
+    if patch.shape[-2] < patch_size or patch.shape[-1] < patch_size:
+        # In the case that the input patch contains more than three dimensions,
+        # pad the leading dimensions with (0, 0).
+        leading_padding = [(0, 0)] * (patch.ndim - 2)
 
-        patch = np.pad(patch,
-                       (*leading_padding,
-                        (pad_up, pad_down),
-                        (pad_left, pad_right)),
-                       mode='symmetric',
+        cp_left = padding[0] if tl_x_padding < 0 else 0
+        cp_right = padding[1] if br_x_padding > W else 0
+        cp_up = padding[2] if tl_y_padding < 0 else 0
+        cp_down = padding[3] if tl_y_padding < 0 else 0
+
+        cp_left //= 2 ** compression_level
+        cp_right //= 2 ** compression_level
+        cp_up //= 2 ** compression_level
+        cp_down //= 2 ** compression_level
+
+        context_padding = (
+            *leading_padding,
+            (cp_up, cp_down),
+            (cp_left, cp_right)
+        )
+
+        filling_padding = (
+            *leading_padding,
+            (0, patch_size - cp_up - cp_down - br_y + tl_y),
+            (0, patch_size - cp_left - cp_right - br_x + tl_x)
+        )
+
+        patch = np.pad(patch, context_padding, mode='symmetric',
                        reflect_type='even')
+        patch = np.pad(patch, filling_padding, mode='constant')
 
     return patch
 
@@ -255,7 +319,10 @@ def zarrdataset_worker_init(worker_id):
     if len(filenames_rois) > 1 and len(filenames_rois) >= worker_info.num_workers:
         num_files_per_worker = int(math.ceil(len(filenames_rois) / worker_info.num_workers))
         curr_worker_filenames = dataset_obj._filenames[worker_id*num_files_per_worker:(worker_id+1)*num_files_per_worker]
-        curr_worker_rois = None
+        if dataset_obj is not None:
+            curr_worker_rois = dataset_obj._rois[worker_id*num_files_per_worker:(worker_id+1)*num_files_per_worker]
+        else:
+            curr_worker_rois = None
     elif len(filenames_rois) == 1 and len(filenames_rois[0][1]) >= worker_info.num_workers:
         num_files_per_worker = int(math.ceil(len(filenames_rois[0][1]) / worker_info.num_workers))
         curr_worker_filenames = [filenames_rois[0][0]]
@@ -263,9 +330,9 @@ def zarrdataset_worker_init(worker_id):
     else:
         raise ValueError('Missmatching number of workers and input files/ROIs')
 
-    dataset_obj._z_list, dataset_obj._rois_list = dataset_obj._preload_files(curr_worker_filenames, group=dataset_obj._data_group, data_axes=dataset_obj._data_axes, rois=curr_worker_rois)
+    dataset_obj._z_list, dataset_obj._rois_list = dataset_obj._preload_files(curr_worker_filenames, data_group=dataset_obj._data_group, data_axes=dataset_obj._data_axes, rois=curr_worker_rois)
     if hasattr(dataset_obj, '_lab_list'):
-        dataset_obj._lab_list, dataset_obj._lab_rois_list = dataset_obj._preload_files(curr_worker_filenames, group=dataset_obj._labels_group, data_axes=dataset_obj._labels_data_axes, rois=curr_worker_rois)
+        dataset_obj._lab_list, dataset_obj._lab_rois_list = dataset_obj._preload_files(curr_worker_filenames, data_group=dataset_obj._labels_group, data_axes=dataset_obj._labels_data_axes, rois=curr_worker_rois)
 
     _, dataset_obj._max_H, dataset_obj._max_W, dataset_obj._org_channels, dataset_obj._imgs_sizes, dataset_obj._imgs_shapes = dataset_obj._compute_size(dataset_obj._z_list, dataset_obj._rois_list)
     dataset_obj._dataset_size //= worker_info.num_workers
@@ -299,6 +366,7 @@ class ZarrDataset(Dataset):
                  compressed_input=False,
                  split_train=0.7,
                  split_val=0.1,
+                 rois=None,
                  **kwargs):
 
         if padding is None:
@@ -331,13 +399,15 @@ class ZarrDataset(Dataset):
         self._requires_split = False
 
         self._filenames = self._split_dataset(root)
+        self._rois = rois
 
         if workers == 0:
-            self._z_list, self._rois_list = self._preload_files(self._filenames, group=self._data_group, data_axes=self._data_axes)
+            self._z_list, self._rois_list, self._compression_level = self._preload_files(self._filenames, data_group=self._data_group, data_axes=self._data_axes, rois=self._rois)
             dataset_size, self._max_H, self._max_W, self._org_channels, self._imgs_sizes, self._imgs_shapes = self._compute_size(self._z_list, self._rois_list)
         else:
             self._z_list = None
             self._rois_list = None
+            self._compression_level = None
             self._max_H = None
             self._max_W = None
             self._org_channels = None
@@ -419,7 +489,7 @@ class ZarrDataset(Dataset):
 
         return filenames
 
-    def _preload_files(self, filenames, group='0/0', data_axes='TCZYX', rois=None):
+    def _preload_files(self, filenames, data_group='0/0', data_axes='TCZYX', rois=None):
         if rois is None:
             filenames_rois = list(map(parse_roi, filenames))
         else:
@@ -427,32 +497,12 @@ class ZarrDataset(Dataset):
 
         z_list = []
         rois_list = []
+        compression_level = 0
 
         for id, (arr_src, rois) in enumerate(filenames_rois):
-            if isinstance(arr_src, zarr.Group) or (isinstance(arr_src, str) and '.zarr' in self._source_format):
-                # If the passed object is a zarr group/file, open it and extract the level from the specified group
-                if isinstance(arr_src, str):
-                    arr_src = zarr.open(arr_src, mode='r')
-
-                arr = arr_src[group]
-                if self._compressed_input and 'compressed' in arr_src.keys() and 'compression_metadata' in arr_src['compressed'].attrs.keys():
-                    comp_metadata = arr_src['compressed'].attrs['compression_metadata']
-                    compressed_channels = comp_metadata['compressed_channels']
-                    org_H = comp_metadata['height']
-                    org_W = comp_metadata['width']
-                    arr_shape = (1, compressed_channels, 1, org_H, org_W)
-                else:
-                    arr_shape = arr.shape
-            elif isinstance(arr_src, str) and '.zarr' not in self._source_format:
-                # If the input is a path to an image stored in a format supported by PIL, open it and use it as a numpy array
-                arr = load_image(arr_src)
-                arr = zarr.array(arr, chunks=(1, arr.shape[1], 1, self._patch_size, self._patch_size))
-                arr_shape = arr.shape
-            else:
-                # Otherwise, use directly the zarr array
-                arr = arr_src
-                arr_shape = arr.shape
-
+            arr, arr_shape, compression_level = \
+                image_to_zarr(arr_src, self._patch_size, self._source_format,
+                              data_group, self._compressed_input)
             z_list.append(arr)
 
             # List all ROIs in this image
@@ -466,7 +516,9 @@ class ZarrDataset(Dataset):
                         slice(ct, ct+lt, 1)
                         ]
 
-                    # Because data could have been passed in a different axes ordering, slicing is reordered to match the input data axes ordering
+                    # Because data could have been passed in a different axes
+                    # ordering, slicing is reordered to match the input data
+                    # axes ordering.
                     roi = [roi['XYZCT'.index(a)] for a in data_axes]
 
                     # Take the ROI as the original size of the image
@@ -476,11 +528,11 @@ class ZarrDataset(Dataset):
                 roi = [slice(0, s, 1) for s in arr_shape]
                 rois_list.append((id, tuple(roi)))
 
-        return z_list, rois_list
+        return z_list, rois_list, compression_level
 
     def _compute_size(self, z_list, rois_list):
-        imgs_shapes = [((roi[-2].stop - roi[-2].start)//roi[-2].step,
-                        (roi[-1].stop - roi[-1].start)//roi[-1].step)
+        imgs_shapes = [(max(self._patch_size, roi[-2].stop - roi[-2].start)//roi[-2].step,
+                        max(self._patch_size, roi[-1].stop - roi[-1].start)//roi[-1].step)
                        for _, roi in rois_list]
         imgs_sizes = np.cumsum([0]
                                + [compute_num_patches(W, self._patch_size,
@@ -520,7 +572,8 @@ class ZarrDataset(Dataset):
                                      self._stride,
                                      self._by_rows)
         id, roi = self._rois_list[i]
-        patch = get_patch(self._z_list[id].get_orthogonal_selection(roi),
+        patch = get_patch(self._z_list[id], 
+                          roi,
                           self._imgs_shapes[id],
                           tl_y,
                           tl_x,
@@ -564,8 +617,8 @@ class LabeledZarrDataset(ZarrDataset):
         if labels_data_axes is None:
             labels_data_axes = self._data_axes
         self._labels_data_axes = labels_data_axes
-        self._lab_list, self._lab_rois_list = \
-            self._preload_files(self._filenames, group=self._labels_group,
+        self._lab_list, self._lab_rois_list, _ = \
+            self._preload_files(self._filenames, data_group=self._labels_group,
                                 data_axes=self._labels_data_axes)
 
         self.shape_augs = None
@@ -588,7 +641,8 @@ class LabeledZarrDataset(ZarrDataset):
                                      self._stride,
                                      self._by_rows)
         id, roi = self._rois_list[i]
-        img = get_patch(self._z_list[id].get_orthogonal_selection(roi),
+        img = get_patch(self._z_list[id],
+                        roi,
                         self._imgs_shapes[id],
                         tl_y,
                         tl_x,
@@ -600,7 +654,8 @@ class LabeledZarrDataset(ZarrDataset):
         img = np.moveaxis(img, 0, -1).astype("uint8")
 
         id, roi = self._lab_rois_list[i]
-        ann = get_patch(self._lab_list[id].get_orthogonal_selection(roi),
+        ann = get_patch(self._lab_list[id],
+                        roi,
                         self._imgs_shapes[id],
                         tl_y,
                         tl_x,
@@ -611,9 +666,11 @@ class LabeledZarrDataset(ZarrDataset):
         ann = np.moveaxis(ann, 0, -1).astype("int32")
 
         if self.shape_augs is not None:
-            shape_augs = self.shape_augs.to_deterministic()
-            img = shape_augs.augment_image(img)
-            ann = shape_augs.augment_image(ann)
+            shape_augs_img = self.shape_augs[0].to_deterministic()
+            shape_augs_ann = self.shape_augs[1].to_deterministic()
+            shape_augs_ann.copy_random_state_(shape_augs_img)
+            img = shape_augs_img.augment_image(img)
+            ann = shape_augs_ann.augment_image(ann)
 
         if self.input_augs is not None:
             input_augs = self.input_augs.to_deterministic()
@@ -640,7 +697,8 @@ class LabeledZarrDataset(ZarrDataset):
         self.augmentor = get_augmentation(self.input_shape, self._data_mode,
                                           seed,
                                           self._compressed_input)
-        self.shape_augs = iaa.Sequential(self.augmentor[0])
+        self.shape_augs = (iaa.Sequential(self.augmentor[0][0]),
+                           iaa.Sequential(self.augmentor[0][1]))
         self.input_augs = iaa.Sequential(self.augmentor[1])
         self.id = self.id + worker_id
         return
