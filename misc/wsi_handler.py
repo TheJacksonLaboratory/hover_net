@@ -6,6 +6,7 @@ import os
 import zarr
 import ome_types
 
+os.add_dll_directory("C:/Users/cervaf/Documents/Apps/openslide/bin")
 import openslide
 
 
@@ -232,9 +233,11 @@ class ZarrHandler(FileHandler):
             ome_metadata.images[0].pixels.physical_size_y
         ])
 
+        # Vendor is not used so it iset to None
         metadata = [
             ("available_mag", magnification_level),  # highest to lowest mag
             ("base_mag", magnification_level[0]),
+            ("vendor", None),
             ("mpp  ", mpp),
             ("base_shape", base_shape),
         ]
