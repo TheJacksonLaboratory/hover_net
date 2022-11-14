@@ -14,13 +14,19 @@
             "--nr_types", "5", "--type_info_path", "type_info.json",
             "--batch_size", "5", "--model_mode", "fast",
             "--model_path",  "C:/Users/cervaf/Documents/Logging/hover_net/pretrained_models/hovernet_fast_monusac_type_tf2pytorch.tar",
-            "--rec_model_path",  "C:/Users/cervaf/OneDrive - The Jackson Laboratory/Projects/2021/Autoencoder_compressor/trained_models/best_ver0.5.5_32203.pth",
-            "--nr_inference_workers", "1", "--nr_post_proc_workers", "1",
+            "--nr_inference_workers", "0", "--nr_post_proc_workers", "0",
+            "--patch_input_size", "256",
             "wsi",
             "--input_dir", "C:/Users/cervaf/Documents/Logging/hover_net/zarr",
             "--output_dir", "C:/Users/cervaf/Documents/Logging/hover_net/result",
             "--input_mask_dir",  "C:/Users/cervaf/Documents/Logging/hover_net/mask",
-        ]
+            "--cache_path", "C:/Users/cervaf/Documents/Logging/hover_net/result/cache",
+            "--proc_mag", "40",
+            "--keep_maps"
+        ],
+        "env": {
+            "KMP_DUPLICATE_LIB_OK": "TRUE"
+        }
         },
         {
             "name": "Python: Current File (Integrated Terminal)",
