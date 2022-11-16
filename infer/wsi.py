@@ -22,6 +22,11 @@ import cv2
 import numpy as np
 import zarr
 from numcodecs import Blosc
+
+import dask
+import dask.array as da
+from dask.diagnostics import ProgressBar
+
 import psutil
 import scipy.io as sio
 import torch
@@ -656,6 +661,525 @@ class InferManager(base.InferManager):
         self.__get_raw_prediction(chunk_info_list, patch_info_list)
         end = time.perf_counter()
         log_info("Inference Time: {0}".format(end - start))
+
+        # TODO: deal with error banding
+        ##### * post processing
+        ##### * done in 3 stages to ensure that nuclei at the boundaries are dealt with accordingly
+        start = time.perf_counter()
+        tile_coord_set = _get_tile_info(self.wsi_proc_shape, tile_shape, ambiguous_size)
+        # 3 sets of patches are extracted and are dealt with differently
+        # tile_grid_info: central region of post processing tiles
+        # tile_boundary_info: boundary region of post processing tiles
+        # tile_cross_info: region at corners of post processing tiles
+        tile_grid_info, tile_boundary_info, tile_cross_info = tile_coord_set
+        tile_grid_info = self.__select_valid_patches(tile_grid_info, False)
+        tile_boundary_info = self.__select_valid_patches(tile_boundary_info, False)
+        tile_cross_info = self.__select_valid_patches(tile_cross_info, False)
+
+        ####################### * Callback can only receive 1 arg
+        def post_proc_normal_tile_callback(args):
+            results, pos_args = args
+            run_idx, tile_tl, tile_br = pos_args
+            pred_inst, inst_info_dict = results
+
+            if len(inst_info_dict) == 0:
+                pbar.update()  # external
+                return  # when there is nothing to do
+
+            top_left = pos_args[1][::-1]
+
+            # ! WARNING:
+            # ! inst ID may not be contiguous,
+            # ! hence must use max as safeguard
+
+            wsi_max_id = 0
+            if len(self.wsi_inst_info) > 0:
+                wsi_max_id = max(self.wsi_inst_info.keys())
+            for inst_id, inst_info in inst_info_dict.items():
+                # now correct the coordinate wrt to wsi
+                inst_info["bbox"] += top_left
+                inst_info["contour"] += top_left
+                inst_info["centroid"] += top_left
+                self.wsi_inst_info[inst_id + wsi_max_id] = inst_info
+            pred_inst[pred_inst > 0] += wsi_max_id
+            if self.wsi_inst_map.ndim > 2:
+                self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
+            else:
+                self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
+
+            pbar.update()  # external
+            return
+
+        ####################### * Callback can only receive 1 arg
+        def post_proc_fixing_tile_callback(args):
+            results, pos_args = args
+            run_idx, tile_tl, tile_br = pos_args
+            pred_inst, inst_info_dict = results
+
+            if len(inst_info_dict) == 0:
+                pbar.update()  # external
+                return  # when there is nothing to do
+
+            top_left = pos_args[1][::-1]
+
+            # for fixing the boundary, keep all nuclei split at boundary (i.e within unambigous region)
+            # of the existing prediction map, and replace all nuclei within the region with newly predicted
+
+            # ! WARNING:
+            # ! inst ID may not be contiguous,
+            # ! hence must use max as safeguard
+
+            # ! must get before the removal happened
+            wsi_max_id = 0
+            if len(self.wsi_inst_info) > 0:
+                wsi_max_id = max(self.wsi_inst_info.keys())
+
+            # * exclude ambiguous out from old prediction map
+            # check 1 pix of 4 edges to find nuclei split at boundary
+            if self.wsi_inst_map.ndim > 2:
+                roi_inst = self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ]
+            else:
+                roi_inst = self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ]
+
+            roi_inst = np.copy(roi_inst)
+            roi_edge = np.concatenate(
+                [roi_inst[[0, -1], :].flatten(), roi_inst[:, [0, -1]].flatten()]
+            )
+            roi_boundary_inst_list = np.unique(roi_edge)[1:]  # exclude background
+            roi_inner_inst_list = np.unique(roi_inst)[1:]
+            roi_inner_inst_list = np.setdiff1d(
+                roi_inner_inst_list, roi_boundary_inst_list, assume_unique=True
+            )
+            roi_inst = _remove_inst(roi_inst, roi_inner_inst_list)
+            if self.wsi_inst_map.ndim > 2:
+                self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = roi_inst
+            else:
+                self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = roi_inst
+            for inst_id in roi_inner_inst_list:
+                self.wsi_inst_info.pop(inst_id, None)
+
+            # * exclude unambiguous out from new prediction map
+            # check 1 pix of 4 edges to find nuclei split at boundary
+            roi_edge = pred_inst[roi_inst > 0]  # remove all overlap
+            boundary_inst_list = np.unique(roi_edge)  # no background to exclude
+            inner_inst_list = np.unique(pred_inst)[1:]
+            inner_inst_list = np.setdiff1d(
+                inner_inst_list, boundary_inst_list, assume_unique=True
+            )
+            pred_inst = _remove_inst(pred_inst, boundary_inst_list)
+
+            # * proceed to overwrite
+            for inst_id in inner_inst_list:
+                # ! happen because we alrd skip thoses with wrong
+                # ! contour (<3 points) within the postproc, so
+                # ! sanity gate here
+                if inst_id not in inst_info_dict:
+                    log_info("Nuclei id=%d not in saved dict WRN1." % inst_id)
+                    continue
+                inst_info = inst_info_dict[inst_id]
+                # now correct the coordinate wrt to wsi
+                inst_info["bbox"] += top_left
+                inst_info["contour"] += top_left
+                inst_info["centroid"] += top_left
+                self.wsi_inst_info[inst_id + wsi_max_id] = inst_info
+            pred_inst[pred_inst > 0] += wsi_max_id
+            pred_inst = roi_inst + pred_inst
+            if self.wsi_inst_map.ndim > 2:
+                self.wsi_inst_map[0, 0, 0,
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
+            else:
+                self.wsi_inst_map[
+                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
+                ] = pred_inst
+
+            pbar.update()  # external
+            return
+
+        #######################
+        pbar_creator = lambda x, y: tqdm.tqdm(
+            desc=y, leave=True, total=int(len(x)), ncols=80, ascii=True, position=0
+        )
+        pbar = pbar_creator(tile_grid_info, "Post Proc Phase 1")
+        # * must be in sequential ordering
+        self.__dispatch_post_processing(tile_grid_info, post_proc_normal_tile_callback)
+        pbar.close()
+
+        pbar = pbar_creator(tile_boundary_info, "Post Proc Phase 2")
+        self.__dispatch_post_processing(tile_boundary_info, post_proc_fixing_tile_callback)
+        pbar.close()
+
+        pbar = pbar_creator(tile_cross_info, "Post Proc Phase 3")
+        self.__dispatch_post_processing(tile_cross_info, post_proc_fixing_tile_callback)
+        pbar.close()
+
+        end = time.perf_counter()
+        log_info("Total Post Proc Time: {0}".format(end - start))
+
+        # ! cant possibly save the inst map at high res, too large
+        start = time.perf_counter()
+        if self.save_mask or self.save_thumb:
+            json_path = "%s/json/%s.json" % (output_dir, wsi_name)
+        else:
+            json_path = "%s/%s.json" % (output_dir, wsi_name)
+        self.__save_json(json_path, self.wsi_inst_info, mag=self.proc_mag)
+        end = time.perf_counter()
+        log_info("Save Time: {0}".format(end - start))
+
+    def process_wsi_list(self, run_args):
+        """Process a list of whole-slide images.
+
+        Args:
+            run_args: arguments as defined in run_infer.py
+        
+        """
+        self._parse_args(run_args)
+
+        if not os.path.exists(self.cache_path):
+            rm_n_mkdir(self.cache_path)
+
+        if not os.path.exists(self.output_dir + "/json/"):
+            rm_n_mkdir(self.output_dir + "/json/")
+        if self.save_thumb:
+            if not os.path.exists(self.output_dir + "/thumb/"):
+                rm_n_mkdir(self.output_dir + "/thumb/")
+        if self.save_mask:
+            if not os.path.exists(self.output_dir + "/mask/"):
+                rm_n_mkdir(self.output_dir + "/mask/")
+
+        wsi_path_list = glob.glob(self.input_dir + "/*")
+        wsi_path_list.sort()  # ensure ordering
+        for wsi_path in wsi_path_list[:]:
+            wsi_base_name = pathlib.Path(wsi_path).stem
+            msk_path = "%s/%s.png" % (self.input_mask_dir, wsi_base_name)
+            if self.save_thumb or self.save_mask:
+                output_file = "%s/json/%s.json" % (self.output_dir, wsi_base_name)
+            else:
+                output_file = "%s/%s.json" % (self.output_dir, wsi_base_name)
+            if os.path.exists(output_file):
+                log_info("Skip: %s" % wsi_base_name)
+                continue
+            try:
+                log_info("Process: %s" % wsi_base_name)
+                self.process_single_file(wsi_path, msk_path, self.output_dir)
+                log_info("Finish")
+            except:
+               logging.exception("Crash")
+
+            if (hasattr(self.wsi_handler.file_ptr, 'store')
+              and '.zarr' in self.wsi_handler.file_ptr.store.path):
+                wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+                if self.keep_maps and os.path.isdir(wsi_pred_map_mmap_path):
+                    source = zarr.open(wsi_pred_map_mmap_path, mode="r")
+                    dest_group = zarr.open("%s/%s_pred_map.zarr" % (self.cache_path, wsi_base_name), mode='w')
+                    zarr.copy(source, dest_group, '0')
+
+        if self.cache_path != self.output_dir:
+            rm_n_mkdir(self.cache_path)  # clean up all cache
+        else:
+            if os.path.isdir("%s/pred_map.zarr" % self.cache_path):
+                shutil.rmtree("%s/pred_map.zarr" % self.cache_path, True)
+            if os.path.isdir("%s/pred_inst.zarr" % self.cache_path):
+                shutil.rmtree("%s/pred_inst.zarr" % self.cache_path, True)
+            if os.path.isfile("%s/pred_map.npy" % self.cache_path):
+                os.remove("%s/pred_map.npy" % self.cache_path)
+            if os.path.isfile("%s/pred_inst.npy" % self.cache_path):
+                os.remove("%s/pred_inst.npy" % self.cache_path)
+        return
+
+
+
+
+####
+class InferManagerDask(base.InferManager):
+    def __save_json(self, path, old_dict, mag=None):
+        new_dict = {}
+        for inst_id, inst_info in old_dict.items():
+            new_inst_info = {}
+            for info_name, info_value in inst_info.items():
+                # convert to jsonable
+                if isinstance(info_value, np.ndarray):
+                    info_value = info_value.tolist()
+                new_inst_info[info_name] = info_value
+            new_dict[int(inst_id)] = new_inst_info
+
+        json_dict = {"mag": mag, "nuc": new_dict}  # to sync the format protocol
+        with open(path, "w") as handle:
+            json.dump(json_dict, handle)
+        return new_dict
+
+    def __select_valid_patches(self, patch_info_list, has_output_info=True):
+        """Select valid patches from the list of input patch information.
+
+        Args:
+            patch_info_list: patch input coordinate information
+            has_output_info: whether output information is given
+        
+        """
+        down_sample_ratio = self.wsi_mask.shape[0] / self.wsi_proc_shape[0]
+        selected_indices = []
+        for idx in range(patch_info_list.shape[0]):
+            patch_info = patch_info_list[idx]
+            patch_info = np.squeeze(patch_info)
+            # get the box at corresponding mag of the mask
+            if has_output_info:
+                output_bbox = patch_info[1] * down_sample_ratio
+            else:
+                output_bbox = patch_info * down_sample_ratio
+            output_bbox = np.rint(output_bbox).astype(np.int64)
+            # coord of the output of the patch (i.e center regions)
+            output_roi = self.wsi_mask[
+                output_bbox[0][0] : output_bbox[1][0],
+                output_bbox[0][1] : output_bbox[1][1],
+            ]
+            if np.sum(output_roi) > 0:
+                selected_indices.append(idx)
+        sub_patch_info_list = patch_info_list[selected_indices]
+        return sub_patch_info_list
+
+    def __dispatch_post_processing(self, tile_info_list, callback):
+        """Post processing initialisation."""
+        proc_pool = None
+        if self.nr_post_proc_workers > 0:
+            proc_pool = ProcessPoolExecutor(self.nr_post_proc_workers)
+
+        future_list = []
+        if (hasattr(self.wsi_handler.file_ptr, 'store')
+           and '.zarr' in self.wsi_handler.file_ptr.store.path):
+            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
+            post_proc_wrapper_fun = _post_proc_para_wrapper_zarr
+        else:
+            wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
+            post_proc_wrapper_fun = _post_proc_para_wrapper
+        for idx in list(range(tile_info_list.shape[0])):
+            tile_tl = tile_info_list[idx][0]
+            tile_br = tile_info_list[idx][1]
+
+            tile_info = (idx, tile_tl, tile_br)
+            func_kwargs = {
+                "nr_types": self.method["model_args"]["nr_types"],
+                "return_centroids": True,
+            }
+
+            # TODO: standarize protocol
+            if proc_pool is not None:
+                proc_future = proc_pool.submit(
+                    post_proc_wrapper_fun,
+                    wsi_pred_map_mmap_path,
+                    tile_info,
+                    self.post_proc_func,
+                    func_kwargs,
+                )
+
+                # ! manually poll future and call callback later as there is no guarantee
+                # ! that the callback is called from main thread
+                future_list.append(proc_future)
+            else:
+                results = post_proc_wrapper_fun(
+                    wsi_pred_map_mmap_path, tile_info, self.post_proc_func, func_kwargs
+                )
+                callback(results)
+        if proc_pool is not None:
+            silent_crash = False
+            # loop over all to check state a.k.a polling
+            for future in as_completed(future_list):
+                # ! silent crash, cancel all and raise error
+                if future.exception() is not None:
+                    silent_crash = True
+                    # ! cancel somehow leads to cascade error later
+                    # ! so just poll it then crash once all future
+                    # ! acquired for now
+                    # for future in future_list:
+                    #     future.cancel()
+                    # break
+                else:
+                    callback(future.result())
+            assert not silent_crash
+        return
+
+    def _parse_args(self, run_args):
+        """Parse command line arguments and set as instance variables."""
+        for variable, value in run_args.items():
+            self.__setattr__(variable, value)
+        # to tuple
+        self.chunk_shape = [self.chunk_shape, self.chunk_shape]
+        self.tile_shape = [self.tile_shape, self.tile_shape]
+        self.patch_input_shape = [self.patch_input_shape, self.patch_input_shape]
+        self.patch_output_shape = [self.patch_output_shape, self.patch_output_shape]
+        return
+
+    @staticmethod
+    def _infer_patch(patch, net, wsi_mag=40.0, scaled_wsi_mag=1.25,
+                     output_channels=3):
+        scale_factor = scaled_wsi_mag / wsi_mag
+        # now rescale then return
+        if scale_factor > 1.0:
+            interp = cv2.INTER_CUBIC
+        else:
+            interp = cv2.INTER_LINEAR
+        wsi_thumb_rgb = cv2.resize(
+            np.moveaxis(patch[0, :, 0], 0, -1), (0, 0), fx=scale_factor,
+            fy=scale_factor,
+            interpolation=interp)
+
+        gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
+        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
+        mask = morphology.remove_small_objects(
+            mask == 0, min_size=16 * 16, connectivity=2
+        )
+        mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+        mask = morphology.binary_dilation(mask, morphology.disk(16))
+        
+        if mask.sum() == 0:
+            _, _, _, H, W = patch.shape
+            res = np.zeros((1, output_channels, 1, H, W))
+        else:
+            with torch.no_grad():
+                res = net(
+                    torch.from_numpy(np.moveaxis(patch[:, :, 0, ...], 1, -1)))
+                res = np.moveaxis(res[np.newaxis, ...], -1, 1)
+
+        return res
+
+    def process_single_file(self, wsi_path, msk_path, output_dir):
+        """Process a single whole-slide image and save the results.
+
+        Args:
+            wsi_path: path to input whole-slide image
+            msk_path: path to input mask. If not supplied, mask will be automatically generated.
+            output_dir: path where output will be saved
+
+        """
+        # TODO: customize universal file handler to sync the protocol
+        ambiguous_size = self.ambiguous_size
+        tile_shape = (np.array(self.tile_shape)).astype(np.int64)
+        chunk_input_shape = np.array(self.chunk_shape)
+        patch_input_shape = np.array(self.patch_input_shape)
+        patch_output_shape = np.array(self.patch_output_shape)
+
+        path_obj = pathlib.Path(wsi_path)
+        wsi_ext = path_obj.suffix
+        wsi_name = path_obj.stem
+
+        start = time.perf_counter()
+        self.wsi_handler = get_file_handler(wsi_path, backend=wsi_ext, data_group=self.method['data_group'])
+
+        if msk_path is not None and os.path.isfile(msk_path):
+            self.wsi_mask = cv2.imread(msk_path)
+            self.wsi_mask = cv2.cvtColor(self.wsi_mask, cv2.COLOR_BGR2GRAY)
+            self.wsi_mask[self.wsi_mask > 0] = 1
+        else:
+            log_info(
+                "WARNING: No mask found, generating mask via thresholding at 1.25x!"
+            )
+
+            # simple method to extract tissue regions using intensity thresholding and morphological operations
+            def simple_get_mask():
+                scaled_wsi_mag = 1.25  # ! hard coded
+                wsi_thumb_rgb = self.wsi_handler.get_full_img(read_mag=scaled_wsi_mag)
+                gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
+                _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
+                mask = morphology.remove_small_objects(
+                    mask == 0, min_size=16 * 16, connectivity=2
+                )
+                mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+                mask = morphology.binary_dilation(mask, morphology.disk(16))
+                return mask
+
+            self.wsi_mask = np.array(simple_get_mask() > 0, dtype=np.uint8)
+
+        if np.sum(self.wsi_mask) == 0:
+            log_info("Skip due to empty mask!")
+            return
+        if self.save_mask:
+            cv2.imwrite("%s/mask/%s.png" % (output_dir, wsi_name), self.wsi_mask * 255)
+        if self.save_thumb:
+            wsi_thumb_rgb = self.wsi_handler.get_full_img(read_mag=1.25)
+            cv2.imwrite(
+                "%s/thumb/%s.png" % (output_dir, wsi_name),
+                cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2BGR),
+            )
+
+        out_ch = 3 if self.method["model_args"]["nr_types"] is None else 4
+        self.wsi_inst_info = {}
+
+        # TODO: Process chunks/tiles/patches according to the mask generated
+        # above. If the mask is blank at that position, return a zero array
+        # instead of the network inference
+        offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
+        z_wsi = da.from_zarr(self.wsi_handler._file_path,
+                             component=self.method['data_group'] + '/0')
+
+        self.wsi_proc_shape = self.wsi_handler.get_dimensions(self.proc_mag)
+        self.wsi_proc_shape = self.wsi_proc_shape[::-1]
+        num_patches = [int(math.ceil(s / p))
+                       for s, p in zip(self.wsi_proc_shape,
+                                       patch_output_shape)]
+
+        paddings = [(0, 0), (0, 0), (0, 0)]
+        paddings += [(0, n_p * p - s + 2 * offset)
+                     for s, p, n_p in zip(self.wsi_proc_shape,
+                                          patch_output_shape,
+                                          num_patches)]
+
+        padded_z_wsi = da.pad(z_wsi, paddings, mode='constant')
+
+        pred_z_wsi = []
+        for i in range(num_patches[0]):
+            pred_z_wsi.append([])
+            row_offset = i * patch_output_shape[0]
+            for j in range(num_patches[1]):
+                col_offset = j * patch_output_shape[1]
+                res = dask.delayed(self._infer_patch)(
+                    padded_z_wsi[...,
+                                 row_offset:row_offset + patch_input_shape[0],
+                                 col_offset:col_offset + patch_input_shape[1]],
+                    net=self.run_step,
+                    wsi_mag=self.wsi_handler.metadata["base_mag"],
+                    scaled_wsi_mag=1.25,
+                    output_channels=out_ch)
+
+                res = da.from_delayed(res, shape=(1, out_ch, 1,
+                                                  patch_output_shape[1],
+                                                  patch_output_shape[0]),
+                                      dtype=np.float32,
+                                      meta=np.empty((0), dtype=np.float32))
+                pred_z_wsi[-1].append(res)
+
+        pred_z_wsi = da.block(pred_z_wsi)
+
+        pred_z_wsi = da.pad(pred_z_wsi, [(0, 0), (0, 0), (0, 0),
+                                         (offset, offset),
+                                         (offset, offset)])
+        pred_z_wsi = pred_z_wsi[..., :self.wsi_proc_shape[0],
+                                :self.wsi_proc_shape[1]]
+        pred_z_wsi = pred_z_wsi.rechunk()
+
+        # dask.config.set(scheduler='single-threaded')
+
+        with ProgressBar():
+            pred_z_wsi.to_zarr("%s/pred_map.zarr" % self.cache_path,
+                            compressor=Blosc(clevel=5),
+                            overwrite=True)
+        self.wsi_pred_map = zarr.open("%s/pred_map.zarr" % self.cache_path, mode='r')
+        self.wsi_inst_map = zarr.open_array(
+            "%s/pred_inst.zarr" % self.cache_path,
+            mode='w',
+            shape=tuple([1, 1, 1] + list(self.wsi_proc_shape)),
+            dtype=np.int32,
+            compressor=Blosc(clevel=5))
 
         # TODO: deal with error banding
         ##### * post processing
