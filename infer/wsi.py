@@ -525,6 +525,9 @@ def _fix_hor_boundaries(inst_info_arr):
      top_info_dict_A,
      bottom_info_dict_A) = inst_info_arr[:, 0, 0]
 
+    if inst_info_arr.shape[2] == 1:
+        return inst_info_arr[..., :1]
+
     left_info_dict_B = inst_info_arr[1, 0, 1]
 
     if len(left_info_dict_B) == 0:
@@ -1420,7 +1423,7 @@ class InferManagerDask(base.InferManager):
             dicts = dict_pred_z_wsi.compute()
 
         self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2},
-                                    list(dicts.flatten()),
+                                    list(dicts[0].flatten()),
                                     {})
 
         all_keys = list(self.wsi_inst_info.keys())
