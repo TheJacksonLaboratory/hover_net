@@ -26,6 +26,8 @@ from numcodecs import Blosc
 import dask
 import dask.array as da
 from dask.diagnostics import ProgressBar
+from scipy.ndimage import measurements, binary_fill_holes
+from skimage import morphology, segmentation
 
 import psutil
 import scipy.io as sio
@@ -301,6 +303,290 @@ def _assemble_and_flush_zarr(wsi_pred_map_mmap_path, chunk_info, patch_output_li
                          pcoord[1] + chunk_info[1][0][1] : pcoord[1] + chunk_info[1][0][1] + pdata.shape[2]] = pdata
     # print(chunk_info.flatten(), 'pass')
     return
+
+
+def _proc_np_hv(pred_inst):
+    blb_raw = pred_inst[..., 0]
+    h_dir_raw = pred_inst[..., 1]
+    v_dir_raw = pred_inst[..., 2]
+
+    # processing
+    blb = np.array(blb_raw >= 0.5, dtype=np.int32)
+
+    blb = measurements.label(blb)[0]
+    blb = morphology.remove_small_objects(blb, min_size=10)
+    blb[blb > 0] = 1  # background is 0 already
+
+    h_dir = cv2.normalize(
+        h_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+    v_dir = cv2.normalize(
+        v_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+
+    sobelh = cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21)
+    sobelv = cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21)
+
+    sobelh = 1 - (
+        cv2.normalize(
+            sobelh, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+    sobelv = 1 - (
+        cv2.normalize(
+            sobelv, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+
+    overall = np.maximum(sobelh, sobelv)
+    overall = overall - (1 - blb)
+    overall[overall < 0] = 0
+
+    dist = (1.0 - overall) * blb
+    ## nuclei values form mountains so inverse to get basins
+    dist = -cv2.GaussianBlur(dist, (3, 3), 0)
+
+    overall = np.array(overall >= 0.4, dtype=np.int32)
+
+    marker = blb - overall
+    marker[marker < 0] = 0
+    marker = binary_fill_holes(marker).astype("uint8")
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
+    marker = measurements.label(marker)[0]
+    marker = morphology.remove_small_objects(marker, min_size=10)
+
+    pred_inst = segmentation.watershed(dist, markers=marker, mask=blb)
+
+    return pred_inst
+
+
+def _infer_patch(patch, net, wsi_mag=40.0, scaled_wsi_mag=1.25):
+    scale_factor = scaled_wsi_mag / wsi_mag
+    # now rescale then return
+    if scale_factor > 1.0:
+        interp = cv2.INTER_CUBIC
+    else:
+        interp = cv2.INTER_LINEAR
+    wsi_thumb_rgb = cv2.resize(
+        np.moveaxis(patch[0, :, 0], 0, -1), (0, 0), fx=scale_factor,
+        fy=scale_factor,
+        interpolation=interp)
+
+    gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
+    mask = morphology.remove_small_objects(
+        mask == 0, min_size=16 * 16, connectivity=2
+    )
+    mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+    mask = morphology.binary_dilation(mask, morphology.disk(16))
+
+    if mask.sum() == 0:
+        pred_map = np.zeros((*patch.shape[-2:], 4))
+
+    else:
+        with torch.no_grad():
+            pred_map = net(
+                torch.from_numpy(np.moveaxis(patch[:, :, 0, ...], 1, -1)))
+            pred_map = pred_map[0]
+
+    return pred_map
+
+
+def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None):
+    if tl_pos is None:
+        tl_pos = (0, 0)
+    if br_pos is None:
+        br_pos = (164, 164)
+
+    inner_info_dict = {}
+    left_info_dict = {}
+    right_info_dict = {}
+    top_info_dict = {}
+    bottom_info_dict = {}
+
+    if pred_map[..., 0].sum() > 0:
+        H, W = pred_map.shape[:2]
+
+        if nr_types is not None:
+            pred_type = pred_map[..., 0]
+            pred_inst = pred_map[..., 1:]
+            pred_type = pred_type.astype(np.int32)
+        else:
+            pred_inst = pred_map
+
+        pred_inst = np.squeeze(pred_inst)
+        pred_inst = _proc_np_hv(pred_inst)
+
+        inst_id_list = np.unique(pred_inst)
+        for inst_id in inst_id_list:
+            if inst_id == 0:
+                # Ignore background
+                continue
+
+            inst_map = pred_inst == inst_id
+            # TODO: chane format of bbox output
+            rmin, rmax, cmin, cmax = get_bounding_box(inst_map)
+            inst_bbox = np.array([[rmin, cmin], [rmax, cmax]])
+            inst_map = inst_map[
+                inst_bbox[0][0] : inst_bbox[1][0], inst_bbox[0][1] : inst_bbox[1][1]
+            ]
+            inst_map = inst_map.astype(np.uint8)
+            inst_moment = cv2.moments(inst_map)
+            inst_contour = cv2.findContours(
+                inst_map, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+            )
+            # * opencv protocol format may break
+            inst_contour = np.squeeze(inst_contour[0][0].astype("int32"))
+            # < 3 points dont make a contour, so skip, likely artifact too
+            # as the contours obtained via approximation => too small or sthg
+            if inst_contour.shape[0] < 3:
+                continue
+            if len(inst_contour.shape) != 2:
+                continue # ! check for trickery shape
+            inst_centroid = [
+                (inst_moment["m10"] / inst_moment["m00"]),
+                (inst_moment["m01"] / inst_moment["m00"]),
+            ]
+            inst_centroid = np.array(inst_centroid)
+            inst_contour[:, 0] += inst_bbox[0][1] + tl_pos[1] # X
+            inst_contour[:, 1] += inst_bbox[0][0] + tl_pos[0]  # Y
+            inst_centroid[0] += inst_bbox[0][1] + tl_pos[1]  # X
+            inst_centroid[1] += inst_bbox[0][0] + tl_pos[0]  # Y
+
+            if nr_types is not None:
+                inst_type_crop = pred_type[inst_bbox[0][0] : inst_bbox[1][0], inst_bbox[0][1] : inst_bbox[1][1]]
+                inst_type = inst_type_crop[np.nonzero(inst_map)]
+                type_list, type_pixels = np.unique(inst_type, return_counts=True)
+                type_list = list(zip(type_list, type_pixels))
+                type_list = sorted(type_list, key=lambda x: x[1], reverse=True)
+                inst_type = type_list[0][0]
+                if inst_type == 0:  # ! pick the 2nd most dominant if exist
+                    if len(type_list) > 1:
+                        inst_type = type_list[1][0]
+                type_dict = {v[0]: v[1] for v in type_list}
+                type_prob = type_dict[inst_type] / (np.sum(inst_map) + 1.0e-6)
+                inst_type = int(inst_type)
+            else:
+                type_prob = None
+                inst_type = None
+
+            bbox_tl_x = inst_bbox[0][1]
+            bbox_tl_y = inst_bbox[0][0]
+            bbox_br_x = inst_bbox[1][1]
+            bbox_br_y = inst_bbox[1][0]
+
+            inst_bbox[0][1] += tl_pos[1] # X
+            inst_bbox[0][0] += tl_pos[0]  # Y
+            inst_bbox[1][1] += tl_pos[1] # X
+            inst_bbox[1][0] += tl_pos[0]  # Y
+
+            inst_info_dict = {
+                    "bbox": inst_bbox.tolist(),
+                    "centroid": inst_centroid.tolist(),
+                    "contour": inst_contour.tolist(),
+                    "type_prob": type_prob,
+                    "type": inst_type,
+                }
+
+            inst_key = '%i,%i,%i,%i,%i' % (*tl_pos, *br_pos, inst_id)
+            inst_pred_map = pred_map[bbox_tl_y:bbox_br_y,
+                                     bbox_tl_x:bbox_br_x,
+                                     1:]
+            inst_pred_map = inst_pred_map * inst_map[..., np.newaxis]
+
+            if bbox_tl_x == 0:
+                left_info_dict[inst_key] = inst_info_dict
+                left_info_dict[inst_key]['pred_map'] = inst_pred_map
+            elif bbox_br_x == W - 1:
+                right_info_dict[inst_key] = inst_info_dict
+                right_info_dict[inst_key]['pred_map'] = inst_pred_map
+            elif bbox_tl_y == 0:
+                top_info_dict[inst_key] = inst_info_dict
+                top_info_dict[inst_key]['pred_map'] = inst_pred_map
+            elif bbox_br_y == H - 1:
+                bottom_info_dict[inst_key] = inst_info_dict
+                bottom_info_dict[inst_key]['pred_map'] = inst_pred_map
+            else:
+                inner_info_dict[inst_key] = inst_info_dict
+
+    inst_info_arr = np.array([[[inner_info_dict]], [[left_info_dict]],
+                              [[right_info_dict]],
+                              [[top_info_dict]],
+                              [[bottom_info_dict]]])
+
+    return inst_info_arr
+
+
+def _fix_hor_boundaries(inst_info_arr):
+    (inner_info_dict_A,
+     left_info_dict_A,
+     right_info_dict_A,
+     top_info_dict_A,
+     bottom_info_dict_A) = inst_info_arr[:, 0, 0]
+
+    left_info_dict_B = inst_info_arr[1, 0, 1]
+
+    if len(left_info_dict_B) == 0:
+        # If there are no objects detected on the left edge of chunk B, move
+        # all objects at the right edge of chunk A, except those at its top or
+        # bottom edge, to the inner object dictionary.
+        for k, d in right_info_dict_A.items():
+            tl_pos = list(map(int, k.split(',')[:2]))
+            br_pos = list(map(int, k.split(',')[2:4]))
+
+            if d['bbox'][0][0] == tl_pos[0]:
+                top_info_dict_A[k] = d
+            elif d['bbox'][1][1] == br_pos[0]:
+                bottom_info_dict_A[k] = d
+            else:
+                inner_info_dict_A[k] = d
+
+    elif len(right_info_dict_A) > 0:
+        chunk_info = list(map(int,
+                              list(right_info_dict_A.keys())[0].split(',')))
+        tl_pos = chunk_info[:2]
+        br_pos = chunk_info[2:4]
+        min_x_A = min(map(lambda d: d[1]['bbox'][0][1],
+                          right_info_dict_A.items()))
+        max_x_B = max(map(lambda d: d[1]['bbox'][1][1],
+                          left_info_dict_B.items()))
+
+        min_y_A = min(map(lambda d: d[1]['bbox'][0][0],
+                          right_info_dict_A.items()))
+        min_y_B = min(map(lambda d: d[1]['bbox'][0][0],
+                          left_info_dict_B.items()))
+
+        max_y_A = max(map(lambda d: d[1]['bbox'][1][0],
+                          right_info_dict_A.items()))
+        max_y_B = max(map(lambda d: d[1]['bbox'][1][0],
+                          left_info_dict_B.items()))
+
+        min_y = min(min_y_A, min_y_B)
+        max_y = max(max_y_A, max_y_B)
+
+        pred_map = np.zeros((max_y - min_y + 1,
+                             max_x_B - min_x_A + 1,
+                             3),
+                            dtype=np.float32)
+
+        for k, d in right_info_dict_A.items():
+            pred_map[d['bbox'][0][0] - min_y:d['bbox'][1][0] - min_y,
+                     d['bbox'][0][1] - min_x_A:d['bbox'][1][1] - min_x_A,
+                     :] = d['pred_map']
+        for k, d in left_info_dict_B.items():
+            pred_map[d['bbox'][0][0] - min_y:d['bbox'][1][0] - min_y,
+                     d['bbox'][0][1] - min_x_A:d['bbox'][1][1] - min_x_A,
+                     :] = d['pred_map']
+
+        # TODO: Run the _proc_np_hv function to the the individual instances
+
+    inst_info_arr = np.array(
+        [[[inner_info_dict_A]], [[left_info_dict_A]], [[{}]],
+         [[top_info_dict_A]],
+         [[bottom_info_dict_A]]])
+
+    return inst_info_arr
 
 
 ####
@@ -904,21 +1190,11 @@ class InferManager(base.InferManager):
 
 ####
 class InferManagerDask(base.InferManager):
-    def __save_json(self, path, old_dict, mag=None):
-        new_dict = {}
-        for inst_id, inst_info in old_dict.items():
-            new_inst_info = {}
-            for info_name, info_value in inst_info.items():
-                # convert to jsonable
-                if isinstance(info_value, np.ndarray):
-                    info_value = info_value.tolist()
-                new_inst_info[info_name] = info_value
-            new_dict[int(inst_id)] = new_inst_info
-
-        json_dict = {"mag": mag, "nuc": new_dict}  # to sync the format protocol
+    def __save_json(self, path, info_dict, mag=None):
+        json_dict = {"mag": mag, "nuc": info_dict}  # to sync the format protocol
         with open(path, "w") as handle:
             json.dump(json_dict, handle)
-        return new_dict
+        return info_dict
 
     def __select_valid_patches(self, patch_info_list, has_output_info=True):
         """Select valid patches from the list of input patch information.
@@ -1020,39 +1296,6 @@ class InferManagerDask(base.InferManager):
         self.patch_output_shape = [self.patch_output_shape, self.patch_output_shape]
         return
 
-    @staticmethod
-    def _infer_patch(patch, net, wsi_mag=40.0, scaled_wsi_mag=1.25,
-                     output_channels=3):
-        scale_factor = scaled_wsi_mag / wsi_mag
-        # now rescale then return
-        if scale_factor > 1.0:
-            interp = cv2.INTER_CUBIC
-        else:
-            interp = cv2.INTER_LINEAR
-        wsi_thumb_rgb = cv2.resize(
-            np.moveaxis(patch[0, :, 0], 0, -1), (0, 0), fx=scale_factor,
-            fy=scale_factor,
-            interpolation=interp)
-
-        gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
-        mask = morphology.remove_small_objects(
-            mask == 0, min_size=16 * 16, connectivity=2
-        )
-        mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
-        mask = morphology.binary_dilation(mask, morphology.disk(16))
-        
-        if mask.sum() == 0:
-            _, _, _, H, W = patch.shape
-            res = np.zeros((1, output_channels, 1, H, W))
-        else:
-            with torch.no_grad():
-                res = net(
-                    torch.from_numpy(np.moveaxis(patch[:, :, 0, ...], 1, -1)))
-                res = np.moveaxis(res[np.newaxis, ...], -1, 1)
-
-        return res
-
     def process_single_file(self, wsi_path, msk_path, output_dir):
         """Process a single whole-slide image and save the results.
 
@@ -1112,7 +1355,6 @@ class InferManagerDask(base.InferManager):
                 cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2BGR),
             )
 
-        out_ch = 3 if self.method["model_args"]["nr_types"] is None else 4
         self.wsi_inst_info = {}
 
         # TODO: Process chunks/tiles/patches according to the mask generated
@@ -1135,217 +1377,55 @@ class InferManagerDask(base.InferManager):
                                           num_patches)]
 
         padded_z_wsi = da.pad(z_wsi, paddings, mode='constant')
-
+        padded_z_wsi = padded_z_wsi.rechunk((1, 3, 1, patch_output_shape[0],
+                                             patch_output_shape[1]))
         pred_z_wsi = []
         for i in range(num_patches[0]):
             pred_z_wsi.append([])
             row_offset = i * patch_output_shape[0]
             for j in range(num_patches[1]):
                 col_offset = j * patch_output_shape[1]
-                res = dask.delayed(self._infer_patch)(
+                res = dask.delayed(_infer_patch)(
                     padded_z_wsi[...,
                                  row_offset:row_offset + patch_input_shape[0],
                                  col_offset:col_offset + patch_input_shape[1]],
                     net=self.run_step,
                     wsi_mag=self.wsi_handler.metadata["base_mag"],
-                    scaled_wsi_mag=1.25,
-                    output_channels=out_ch)
+                    scaled_wsi_mag=1.25)
 
-                res = da.from_delayed(res, shape=(1, out_ch, 1,
-                                                  patch_output_shape[1],
-                                                  patch_output_shape[0]),
-                                      dtype=np.float32,
-                                      meta=np.empty((0), dtype=np.float32))
+                res = dask.delayed(_post_process)(
+                    res,
+                    nr_types=self.nr_types,
+                    tl_pos=(row_offset + offset, col_offset + offset),
+                    br_pos=(row_offset + patch_output_shape[0] + offset - 1,
+                            col_offset + patch_output_shape[1] + offset - 1))
+
+                res = da.from_delayed(res, shape=(5, 1, 1),
+                                      dtype=np.object,
+                                      meta=np.empty((0), dtype=np.object))
                 pred_z_wsi[-1].append(res)
 
         pred_z_wsi = da.block(pred_z_wsi)
 
-        pred_z_wsi = da.pad(pred_z_wsi, [(0, 0), (0, 0), (0, 0),
-                                         (offset, offset),
-                                         (offset, offset)])
-        pred_z_wsi = pred_z_wsi[..., :self.wsi_proc_shape[0],
-                                :self.wsi_proc_shape[1]]
-        pred_z_wsi = pred_z_wsi.rechunk()
-
-        # dask.config.set(scheduler='single-threaded')
-
-        with ProgressBar():
-            pred_z_wsi.to_zarr("%s/pred_map.zarr" % self.cache_path,
-                            compressor=Blosc(clevel=5),
-                            overwrite=True)
-        self.wsi_pred_map = zarr.open("%s/pred_map.zarr" % self.cache_path, mode='r')
-        self.wsi_inst_map = zarr.open_array(
-            "%s/pred_inst.zarr" % self.cache_path,
-            mode='w',
-            shape=tuple([1, 1, 1] + list(self.wsi_proc_shape)),
-            dtype=np.int32,
-            compressor=Blosc(clevel=5))
-
-        # TODO: deal with error banding
-        ##### * post processing
-        ##### * done in 3 stages to ensure that nuclei at the boundaries are dealt with accordingly
-        start = time.perf_counter()
-        tile_coord_set = _get_tile_info(self.wsi_proc_shape, tile_shape, ambiguous_size)
-        # 3 sets of patches are extracted and are dealt with differently
-        # tile_grid_info: central region of post processing tiles
-        # tile_boundary_info: boundary region of post processing tiles
-        # tile_cross_info: region at corners of post processing tiles
-        tile_grid_info, tile_boundary_info, tile_cross_info = tile_coord_set
-        tile_grid_info = self.__select_valid_patches(tile_grid_info, False)
-        tile_boundary_info = self.__select_valid_patches(tile_boundary_info, False)
-        tile_cross_info = self.__select_valid_patches(tile_cross_info, False)
-
-        ####################### * Callback can only receive 1 arg
-        def post_proc_normal_tile_callback(args):
-            results, pos_args = args
-            run_idx, tile_tl, tile_br = pos_args
-            pred_inst, inst_info_dict = results
-
-            if len(inst_info_dict) == 0:
-                pbar.update()  # external
-                return  # when there is nothing to do
-
-            top_left = pos_args[1][::-1]
-
-            # ! WARNING:
-            # ! inst ID may not be contiguous,
-            # ! hence must use max as safeguard
-
-            wsi_max_id = 0
-            if len(self.wsi_inst_info) > 0:
-                wsi_max_id = max(self.wsi_inst_info.keys())
-            for inst_id, inst_info in inst_info_dict.items():
-                # now correct the coordinate wrt to wsi
-                inst_info["bbox"] += top_left
-                inst_info["contour"] += top_left
-                inst_info["centroid"] += top_left
-                self.wsi_inst_info[inst_id + wsi_max_id] = inst_info
-            pred_inst[pred_inst > 0] += wsi_max_id
-            if self.wsi_inst_map.ndim > 2:
-                self.wsi_inst_map[0, 0, 0,
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ] = pred_inst
-            else:
-                self.wsi_inst_map[
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ] = pred_inst
-
-            pbar.update()  # external
-            return
-
-        ####################### * Callback can only receive 1 arg
-        def post_proc_fixing_tile_callback(args):
-            results, pos_args = args
-            run_idx, tile_tl, tile_br = pos_args
-            pred_inst, inst_info_dict = results
-
-            if len(inst_info_dict) == 0:
-                pbar.update()  # external
-                return  # when there is nothing to do
-
-            top_left = pos_args[1][::-1]
-
-            # for fixing the boundary, keep all nuclei split at boundary (i.e within unambigous region)
-            # of the existing prediction map, and replace all nuclei within the region with newly predicted
-
-            # ! WARNING:
-            # ! inst ID may not be contiguous,
-            # ! hence must use max as safeguard
-
-            # ! must get before the removal happened
-            wsi_max_id = 0
-            if len(self.wsi_inst_info) > 0:
-                wsi_max_id = max(self.wsi_inst_info.keys())
-
-            # * exclude ambiguous out from old prediction map
-            # check 1 pix of 4 edges to find nuclei split at boundary
-            if self.wsi_inst_map.ndim > 2:
-                roi_inst = self.wsi_inst_map[0, 0, 0,
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ]
-            else:
-                roi_inst = self.wsi_inst_map[
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ]
-
-            roi_inst = np.copy(roi_inst)
-            roi_edge = np.concatenate(
-                [roi_inst[[0, -1], :].flatten(), roi_inst[:, [0, -1]].flatten()]
-            )
-            roi_boundary_inst_list = np.unique(roi_edge)[1:]  # exclude background
-            roi_inner_inst_list = np.unique(roi_inst)[1:]
-            roi_inner_inst_list = np.setdiff1d(
-                roi_inner_inst_list, roi_boundary_inst_list, assume_unique=True
-            )
-            roi_inst = _remove_inst(roi_inst, roi_inner_inst_list)
-            if self.wsi_inst_map.ndim > 2:
-                self.wsi_inst_map[0, 0, 0,
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ] = roi_inst
-            else:
-                self.wsi_inst_map[
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ] = roi_inst
-            for inst_id in roi_inner_inst_list:
-                self.wsi_inst_info.pop(inst_id, None)
-
-            # * exclude unambiguous out from new prediction map
-            # check 1 pix of 4 edges to find nuclei split at boundary
-            roi_edge = pred_inst[roi_inst > 0]  # remove all overlap
-            boundary_inst_list = np.unique(roi_edge)  # no background to exclude
-            inner_inst_list = np.unique(pred_inst)[1:]
-            inner_inst_list = np.setdiff1d(
-                inner_inst_list, boundary_inst_list, assume_unique=True
-            )
-            pred_inst = _remove_inst(pred_inst, boundary_inst_list)
-
-            # * proceed to overwrite
-            for inst_id in inner_inst_list:
-                # ! happen because we alrd skip thoses with wrong
-                # ! contour (<3 points) within the postproc, so
-                # ! sanity gate here
-                if inst_id not in inst_info_dict:
-                    log_info("Nuclei id=%d not in saved dict WRN1." % inst_id)
-                    continue
-                inst_info = inst_info_dict[inst_id]
-                # now correct the coordinate wrt to wsi
-                inst_info["bbox"] += top_left
-                inst_info["contour"] += top_left
-                inst_info["centroid"] += top_left
-                self.wsi_inst_info[inst_id + wsi_max_id] = inst_info
-            pred_inst[pred_inst > 0] += wsi_max_id
-            pred_inst = roi_inst + pred_inst
-            if self.wsi_inst_map.ndim > 2:
-                self.wsi_inst_map[0, 0, 0,
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ] = pred_inst
-            else:
-                self.wsi_inst_map[
-                    tile_tl[0] : tile_br[0], tile_tl[1] : tile_br[1]
-                ] = pred_inst
-
-            pbar.update()  # external
-            return
-
-        #######################
-        pbar_creator = lambda x, y: tqdm.tqdm(
-            desc=y, leave=True, total=int(len(x)), ncols=80, ascii=True, position=0
+        dict_pred_z_wsi = pred_z_wsi.map_overlap(
+            _fix_hor_boundaries,
+            depth=((0, 0), (0, 0), (0, 1)),
+            boundary=None,
+            trim=False,
+            dtype=np.object
         )
-        pbar = pbar_creator(tile_grid_info, "Post Proc Phase 1")
-        # * must be in sequential ordering
-        self.__dispatch_post_processing(tile_grid_info, post_proc_normal_tile_callback)
-        pbar.close()
 
-        pbar = pbar_creator(tile_boundary_info, "Post Proc Phase 2")
-        self.__dispatch_post_processing(tile_boundary_info, post_proc_fixing_tile_callback)
-        pbar.close()
+        dask.config.set(scheduler='single-threaded')
+        with ProgressBar():
+            dicts = dict_pred_z_wsi.compute()
 
-        pbar = pbar_creator(tile_cross_info, "Post Proc Phase 3")
-        self.__dispatch_post_processing(tile_cross_info, post_proc_fixing_tile_callback)
-        pbar.close()
+        self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2},
+                                    list(dicts.flatten()),
+                                    {})
 
-        end = time.perf_counter()
-        log_info("Total Post Proc Time: {0}".format(end - start))
+        all_keys = list(self.wsi_inst_info.keys())
+        for i, k in enumerate(all_keys):
+            self.wsi_inst_info[i+1] = self.wsi_inst_info.pop(k)
 
         # ! cant possibly save the inst map at high res, too large
         start = time.perf_counter()
@@ -1390,12 +1470,14 @@ class InferManagerDask(base.InferManager):
             if os.path.exists(output_file):
                 log_info("Skip: %s" % wsi_base_name)
                 continue
-            try:
-                log_info("Process: %s" % wsi_base_name)
-                self.process_single_file(wsi_path, msk_path, self.output_dir)
-                log_info("Finish")
-            except:
-               logging.exception("Crash")
+
+            self.process_single_file(wsi_path, msk_path, self.output_dir)
+            # try:
+            #     log_info("Process: %s" % wsi_base_name)
+            #     self.process_single_file(wsi_path, msk_path, self.output_dir)
+            #     log_info("Finish")
+            # except:
+            #    logging.exception("Crash")
 
             if (hasattr(self.wsi_handler.file_ptr, 'store')
               and '.zarr' in self.wsi_handler.file_ptr.store.path):
