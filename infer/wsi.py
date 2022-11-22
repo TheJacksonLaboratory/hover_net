@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 from functools import reduce
+from itertools import chain
 from importlib import import_module
 
 import cv2
@@ -393,21 +394,42 @@ def _infer_patch(patch, net, wsi_mag=40.0, scaled_wsi_mag=1.25):
     return pred_map
 
 
-def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None,
+def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
+                  tile_shape=None,
+                  num_tiles=None,
                   check_sides_first=True,
-                  ambiguous_size=128):
-    if tl_pos is None:
-        tl_pos = (0, 0)
-    if br_pos is None:
-        br_pos = (1640, 1640)
+                  ambiguous_size=128,
+                  merge_edges=True):
+    tl_pos = (block_id[0] * tile_shape[0] + offset[0],
+              block_id[1] * tile_shape[1] + offset[1])
+    br_pos = (tl_pos[0] + tile_shape[0], tl_pos[1] + tile_shape[1])
 
-    inner_info_dict = {}
-    left_info_dict = {}
-    right_info_dict = {}
-    top_info_dict = {}
-    bottom_info_dict = {}
+    merge_edges_top = block_id[0] == 0 and merge_edges
+    merge_edges_bottom = block_id[0] == num_tiles[0] - 1 and merge_edges
+    merge_edges_left = block_id[1] == 0 and merge_edges
+    merge_edges_right = block_id[1] == num_tiles[1] - 1 and merge_edges
 
-    bound_pred_maps = dict(left=None, right=None, top=None, bottom=None)
+    info_dicts = dict(
+        tl_pos=tl_pos,
+        br_pos=br_pos,
+        inner={},
+        left={},
+        right={},
+        top={},
+        bottom={},
+        bound_pred_maps=dict(
+            left=None,
+            left_tl_pos=(tl_pos[0], tl_pos[1]),
+            left_br_pos=(br_pos[0], tl_pos[1] + ambiguous_size),
+            right=None,
+            right_tl_pos=(tl_pos[0], br_pos[1] - ambiguous_size),
+            right_br_pos=(br_pos[0], br_pos[1]),
+            top=None,
+            top_tl_pos=(tl_pos[0], tl_pos[1]),
+            top_br_pos=(tl_pos[0] + ambiguous_size, br_pos[1]),
+            bottom=None,
+            bottom_tl_pos=(br_pos[0] - ambiguous_size, tl_pos[1]),
+            bottom_br_pos=(br_pos[0], br_pos[1])))
 
     if pred_map[..., 0].sum() > 0:
         H, W = pred_map.shape[:2]
@@ -421,6 +443,19 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None,
 
         pred_inst = np.squeeze(pred_inst)
         pred_inst = _proc_np_hv(pred_inst)
+
+        if not merge_edges_left and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['left'] = np.copy(
+                pred_map[:, :ambiguous_size, :])
+        if not merge_edges_right and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['right'] = np.copy(
+                pred_map[:, -ambiguous_size:, :])
+        if not merge_edges_top and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['top'] = np.copy(
+                pred_map[:ambiguous_size, :, :])
+        if not merge_edges_bottom and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['bottom'] = np.copy(
+                pred_map[-ambiguous_size:, :, :])
 
         inst_id_list = np.unique(pred_inst)
         for inst_id in inst_id_list:
@@ -452,7 +487,7 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None,
                 (inst_moment["m01"] / inst_moment["m00"]),
             ]
             inst_centroid = np.array(inst_centroid)
-            inst_contour[:, 0] += inst_bbox[0][1] + tl_pos[1] # X
+            inst_contour[:, 0] += inst_bbox[0][1] + tl_pos[1]  # X
             inst_contour[:, 1] += inst_bbox[0][0] + tl_pos[0]  # Y
             inst_centroid[0] += inst_bbox[0][1] + tl_pos[1]  # X
             inst_centroid[1] += inst_bbox[0][0] + tl_pos[0]  # Y
@@ -496,7 +531,7 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None,
 
             inst_key = '%i,%i,%i,%i,%i' % (*tl_pos, *br_pos, inst_id)
 
-            info_dict = inner_info_dict
+            info_dict_key = 'inner'
             inst_pred_map = None
 
             if ambiguous_size > 0:
@@ -511,220 +546,209 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None,
                                                 inst_map[..., np.newaxis]),
                                                axis=2)
 
-                if (bound_pred_maps['left'] is None
-                  or bound_pred_maps['right'] is None
-                  or bound_pred_maps['top'] is None
-                  or bound_pred_maps['bottom'] is None):
-                    bound_pred_maps['left'] = np.copy(
-                        pred_map[:, :ambiguous_size, :])
-                    bound_pred_maps['right'] = np.copy(
-                        pred_map[:, -ambiguous_size:, :])
-                    bound_pred_maps['top'] = np.copy(
-                        pred_map[:ambiguous_size, :, :])
-                    bound_pred_maps['bottom'] = np.copy(
-                        pred_map[-ambiguous_size:, :, :])
-
                 if check_sides_first:
-                    if bbox_tl_x < ambiguous_size:
-                        info_dict = left_info_dict
-                    elif bbox_br_x >= W - ambiguous_size:
-                        info_dict = right_info_dict
-                    elif bbox_tl_y < ambiguous_size:
-                        info_dict = top_info_dict
-                    elif bbox_br_y >= H - ambiguous_size:
-                        info_dict = bottom_info_dict
+                    if (bbox_tl_x < ambiguous_size
+                      and not merge_edges_left):
+                        info_dict_key = 'left'
+                    elif (bbox_br_x >= W - ambiguous_size
+                      and not merge_edges_right):
+                        info_dict_key = 'right'
+                    elif (bbox_tl_y < ambiguous_size
+                      and not merge_edges_top):
+                        info_dict_key = 'top'
+                    elif (bbox_br_y >= H - ambiguous_size
+                      and not merge_edges_bottom):
+                        info_dict_key = 'bottom'
                     else:
                         inst_pred_map = None
                 else:
-                    if bbox_tl_y < ambiguous_size:
-                        info_dict = top_info_dict
-                    elif bbox_br_y >= H - ambiguous_size:
-                        info_dict = bottom_info_dict
-                    elif bbox_tl_x < ambiguous_size:
-                        info_dict = left_info_dict
-                    elif bbox_br_x >= W - ambiguous_size:
-                        info_dict = right_info_dict
+                    if (bbox_tl_y < ambiguous_size
+                      and not merge_edges_top):
+                        info_dict_key = 'top'
+                    elif (bbox_br_y >= H - ambiguous_size
+                      and not merge_edges_bottom):
+                        info_dict_key = 'bottom'
+                    elif (bbox_tl_x < ambiguous_size
+                      and not merge_edges_left):
+                        info_dict_key = 'left'
+                    elif (bbox_br_x >= W - ambiguous_size
+                      and not merge_edges_right):
+                        info_dict_key = 'right'
                     else:
                         inst_pred_map = None
 
-            info_dict[inst_key] = inst_info_dict
-            info_dict[inst_key]['pred_map'] = inst_pred_map
+            info_dicts[info_dict_key][inst_key] = inst_info_dict
+            info_dicts[info_dict_key][inst_key]['pred_map'] = inst_pred_map
 
-    inst_info_arr = np.array([[[inner_info_dict]], [[left_info_dict]],
-                              [[right_info_dict]],
-                              [[top_info_dict]],
-                              [[bottom_info_dict]],
-                              [[bound_pred_maps]]])
+    inst_info_arr = np.array([[info_dicts]])
 
     return inst_info_arr
 
 
-def _fix_hor_boundaries(inst_info_arr, nr_types=None, ambiguous_size=128):
-    (inner_info_dict_A,
-     left_info_dict_A,
-     right_info_dict_A,
-     top_info_dict_A,
-     bottom_info_dict_A,
-     bound_pred_maps_A) = inst_info_arr[:, 0, 0]
+def _fix_hor_boundaries(inst_info_arr, nr_types=None):
+    info_dicts_A = inst_info_arr[0, 0]
 
-    chunk_info = reduce(lambda l1, l2: l1 + list(l2.keys()),
-                        inst_info_arr[:-1, 0, 0],
-                        [])
+    if inst_info_arr.shape[1] == 1:
+        return inst_info_arr[:, :1]
 
-    if inst_info_arr.shape[2] == 1 or len(chunk_info) == 0:
-        return inst_info_arr[..., :1]
+    info_dicts_B = inst_info_arr[0, 1]
 
-    left_info_dict_B = inst_info_arr[1, 0, 1]
-    bound_pred_maps_B = inst_info_arr[5, 0, 1]
-
-    chunk_info = list(map(int, chunk_info[0].split(',')))
-    tl_pos = chunk_info[:2]
-    br_pos = chunk_info[2:4]
-
-    if bound_pred_maps_B['left'] is not None:
-        pred_map = np.hstack((bound_pred_maps_A['right'],
-                              bound_pred_maps_B['left']))
+    # Check if any of the two chunks is empty before continue
+    if (info_dicts_A['bound_pred_maps']['left'] is not None
+      and info_dicts_B['bound_pred_maps']['left'] is not None):
+        pred_map = np.hstack(
+            (info_dicts_A['bound_pred_maps']['right'],
+             info_dicts_B['bound_pred_maps']['left']))
+    elif info_dicts_A['bound_pred_maps']['left'] is not None:
+        pred_map = np.hstack(
+            (info_dicts_A['bound_pred_maps']['right'],
+             np.zeros_like(info_dicts_A['bound_pred_maps']['right'])))
+    elif info_dicts_B['bound_pred_maps']['left'] is not None:
+        pred_map = np.hstack(
+            (np.zeros_like(info_dicts_B['bound_pred_maps']['left']),
+             info_dicts_B['bound_pred_maps']['left']))
     else:
-        pred_map = np.vstack((bound_pred_maps_A['right'],
-                              np.zeros_like(bound_pred_maps_A['right'])))
+        return inst_info_arr[:, :1]
 
-    pred_map_tl = (tl_pos[0], br_pos[1] - pred_map.shape[1] // 2)
+    pred_map_tl = info_dicts_A['bound_pred_maps']['right_tl_pos']
+    pred_map_br = info_dicts_B['bound_pred_maps']['left_br_pos']
 
-    pred_map_br = (pred_map_tl[0] + pred_map.shape[0],
-                   pred_map_tl[1] + pred_map.shape[1])
+    min_y = min(chain(map(lambda d: d[1]['bbox'][0][0],
+                          info_dicts_A['right'].items()),
+                      map(lambda d: d[1]['bbox'][0][0],
+                          info_dicts_B['left'].items()),
+                      [pred_map_tl[0]]))
 
-    min_x = min(map(lambda d: d[1]['bbox'][0][1],
-                    right_info_dict_A.items()),
-                default=pred_map_tl[1])
+    min_x = min(chain(map(lambda d: d[1]['bbox'][0][1],
+                          info_dicts_A['right'].items()),
+                      map(lambda d: d[1]['bbox'][0][1],
+                          info_dicts_B['left'].items()),
+                      [pred_map_tl[1]]))
 
-    min_x = min(min_x, pred_map_tl[1])
+    max_y = max(chain(map(lambda d: d[1]['bbox'][1][0],
+                          info_dicts_A['right'].items()),
+                      map(lambda d: d[1]['bbox'][1][0],
+                          info_dicts_B['left'].items()),
+                      [pred_map_br[0]]))
 
-    max_x = max(map(lambda d: d[1]['bbox'][1][1],
-                    left_info_dict_B.items()),
-                default=pred_map_br[1])
-
-    max_x = max(max_x, pred_map_br[1])
-
-    pad_x_A = pred_map_tl[1] - min_x
-    pad_x_B = max_x - pred_map_br[1]
-
-    pred_map = np.pad(pred_map, ((0, 0), (pad_x_A, pad_x_B), (0, 0)))
-
-    for k, d in right_info_dict_A.items():
-        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
-        pred_map[(inst_y + d['bbox'][0][0] - tl_pos[0],
-                    inst_x + d['bbox'][0][1] - min_x)] = \
-                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
-
-    for k, d in left_info_dict_B.items():
-        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
-        pred_map[(inst_y + d['bbox'][0][0] - tl_pos[0],
-                    inst_x + d['bbox'][0][1] - min_x)] = \
-                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
-
-    # Run the _post_process and get the dictionary for the individual
-    # instances at the chunk boundaries
-    bound_inst_info_arr = _post_process(pred_map, nr_types=nr_types,
-                                        tl_pos=(tl_pos[0], min_x),
-                                        br_pos=(br_pos[0], max_x),
-                                        check_sides_first=False,
-                                        ambiguous_size=ambiguous_size)
-
-    inner_info_dict_A.update(bound_inst_info_arr[0, 0, 0])
-    inner_info_dict_A.update(bound_inst_info_arr[1, 0, 0])
-    inner_info_dict_A.update(bound_inst_info_arr[2, 0, 0])
-    top_info_dict_A.update(bound_inst_info_arr[3, 0, 0])
-    bottom_info_dict_A.update(bound_inst_info_arr[4, 0, 0])
-
-    inst_info_arr = np.array(
-        [[[inner_info_dict_A]], [[left_info_dict_A]], [[{}]],
-         [[top_info_dict_A]],
-         [[bottom_info_dict_A]],
-         [[dict(top=bound_pred_maps_A['top'],
-                bottom=bound_pred_maps_A['bottom'])]]])
-
-    return inst_info_arr
-
-
-def _fix_ver_boundaries(inst_info_arr, nr_types=None):
-    (inner_info_dict_A,
-     left_info_dict_A,
-     right_info_dict_A,
-     top_info_dict_A,
-     bottom_info_dict_A,
-     bound_pred_maps_A) = inst_info_arr[:, 0, 0]
-
-    chunk_info = reduce(lambda l1, l2: l1 + list(l2.keys()),
-                        inst_info_arr[:-1, 0, 0],
-                        [])
-
-    if inst_info_arr.shape[1] == 1 or len(chunk_info) == 0:
-        # Tile A does not contain any object, or tile B is empty
-        return inst_info_arr[..., :1, :]
-
-    top_info_dict_B = inst_info_arr[3, 1, 0]
-    bound_pred_maps_B = inst_info_arr[5, 1, 0]
-
-    chunk_info = list(map(int, chunk_info[0].split(',')))
-    tl_pos = chunk_info[:2]
-    br_pos = chunk_info[2:4]
-
-    if bound_pred_maps_B['top'] is not None:
-        pred_map = np.vstack((bound_pred_maps_A['bottom'],
-                              bound_pred_maps_B['top']))
-    else:
-        pred_map = np.vstack((bound_pred_maps_A['bottom'],
-                              np.zeros_like(bound_pred_maps_A['bottom'])))
-
-    pred_map_tl = (br_pos[0] - pred_map.shape[0] // 2,
-                    tl_pos[1] + (br_pos[1] - tl_pos[1] - pred_map.shape[1]) // 2)
-    pred_map_br = (pred_map_tl[0] + pred_map.shape[0],
-                    pred_map_tl[1] + pred_map.shape[1])
-    
-    min_y = min(map(lambda d: d[1]['bbox'][0][0],
-                    bottom_info_dict_A.items()),
-                default=pred_map_tl[0])
-    min_y = min(min_y, pred_map_tl[0])
-
-    max_y = max(map(lambda d: d[1]['bbox'][1][0],
-                    top_info_dict_B.items()),
-                default=pred_map_br[0])
-    max_y = max(max_y, pred_map_br[0])
-
-    min_x_A = min(map(lambda d: d[1]['bbox'][0][1],
-                      bottom_info_dict_A.items()),
-                  default=pred_map_tl[1])
-                  
-    min_x_B = min(map(lambda d: d[1]['bbox'][0][1],
-                      top_info_dict_B.items()),
-                  default=pred_map_tl[1])
-
-    min_x = min(min_x_A, min_x_B, pred_map_tl[1])
-
-    max_x_A = max(map(lambda d: d[1]['bbox'][1][1],
-                      bottom_info_dict_A.items()),
-                  default=pred_map_br[1])
-
-    max_x_B = max(map(lambda d: d[1]['bbox'][1][1],
-                      top_info_dict_B.items()),
-                  default=pred_map_br[1])
-
-    max_x = max(max_x_A, max_x_B, pred_map_br[1])
+    max_x = max(chain(map(lambda d: d[1]['bbox'][1][1],
+                          info_dicts_A['right'].items()),
+                      map(lambda d: d[1]['bbox'][1][1],
+                          info_dicts_B['left'].items()),
+                      [pred_map_br[1]]))
 
     pad_y_A = pred_map_tl[0] - min_y
     pad_x_A = pred_map_tl[1] - min_x
     pad_y_B = max_y - pred_map_br[0]
     pad_x_B = max_x - pred_map_br[1]
 
-    pred_map = np.pad(pred_map, ((pad_y_A, pad_y_B), (pad_x_A, pad_x_B), (0, 0)))
+    pred_map = np.pad(pred_map,
+                      ((pad_y_A, pad_y_B), (pad_x_A, pad_x_B), (0, 0)))
 
-    for k, d in bottom_info_dict_A.items():
+    for k, d in info_dicts_A['right'].items():
+        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
+        pred_map[(inst_y + d['bbox'][0][0] - min_y,
+                  inst_x + d['bbox'][0][1] - min_x)] = \
+                d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+
+    for k, d in info_dicts_B['left'].items():
+        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
+        pred_map[(inst_y + d['bbox'][0][0] - min_y,
+                  inst_x + d['bbox'][0][1] - min_x)] = \
+                d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+
+    # Run the _post_process and get the dictionary for the individual
+    # instances at the chunk boundaries
+    bound_inst_info_arr = _post_process(pred_map, block_id=(0, 0), 
+                                        nr_types=nr_types,
+                                        offset=(min_y, min_x),
+                                        tile_shape=(max_y - min_y,
+                                                    max_x - min_x),
+                                        num_tiles=(1, 1),
+                                        check_sides_first=False,
+                                        ambiguous_size=0,
+                                        merge_edges=False)
+
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
+    info_dicts_A['left'] = {}
+    info_dicts_A['right'] = {}
+    info_dicts_A['bound_pred_maps']['left'] = {}
+    info_dicts_A['bound_pred_maps']['right'] = {}
+
+    inst_info_arr = np.array([[info_dicts_A]])
+
+    return inst_info_arr
+
+
+def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
+                        num_tiles=None,
+                        ambiguous_size=128):
+    info_dicts_A = inst_info_arr[0, 0]
+
+    if inst_info_arr.shape[0] == 1:
+        # Tile A does not contain any object, or tile B is empty
+        return inst_info_arr[:1, :]
+
+    info_dicts_B = inst_info_arr[1, 0]
+
+    # Check if any of the two chunks is empty before continue
+    if (info_dicts_A['bound_pred_maps']['bottom'] is not None
+      and info_dicts_B['bound_pred_maps']['top'] is not None):
+        pred_map = np.vstack((info_dicts_A['bound_pred_maps']['bottom'],
+                              info_dicts_B['bound_pred_maps']['top']))
+    elif info_dicts_A['bound_pred_maps']['bottom'] is not None:
+        pred_map = np.vstack((info_dicts_A['bound_pred_maps']['bottom'],
+                              np.zeros_like(
+                                info_dicts_A['bound_pred_maps']['bottom'])))
+    elif info_dicts_B['bound_pred_maps']['top'] is not None:
+        pred_map = np.vstack((np.zeros_like(
+                                info_dicts_B['bound_pred_maps']['top']),
+                              info_dicts_B['bound_pred_maps']['top']))
+    else:
+        return inst_info_arr[:1, :]
+
+    pred_map_tl = info_dicts_A['bound_pred_maps']['bottom_tl_pos']
+    pred_map_br = info_dicts_B['bound_pred_maps']['top_br_pos']
+
+    min_y = min(chain(map(lambda d: d[1]['bbox'][0][0],
+                          info_dicts_A['bottom'].items()),
+                      map(lambda d: d[1]['bbox'][0][0],
+                          info_dicts_B['top'].items()),
+                      [pred_map_tl[0]]))
+
+    min_x = min(chain(map(lambda d: d[1]['bbox'][0][1],
+                          info_dicts_A['bottom'].items()),
+                      map(lambda d: d[1]['bbox'][0][1],
+                          info_dicts_B['top'].items()),
+                      [pred_map_tl[1]]))
+
+    max_y = max(chain(map(lambda d: d[1]['bbox'][1][0],
+                          info_dicts_A['bottom'].items()),
+                      map(lambda d: d[1]['bbox'][1][0],
+                          info_dicts_B['top'].items()),
+                      [pred_map_br[0]]))
+
+    max_x = max(chain(map(lambda d: d[1]['bbox'][1][1],
+                          info_dicts_A['bottom'].items()),
+                      map(lambda d: d[1]['bbox'][1][1],
+                          info_dicts_B['top'].items()),
+                      [pred_map_br[1]]))
+
+    pad_y_A = pred_map_tl[0] - min_y
+    pad_x_A = pred_map_tl[1] - min_x
+    pad_y_B = max_y - pred_map_br[0]
+    pad_x_B = max_x - pred_map_br[1]
+
+    pred_map = np.pad(pred_map, ((pad_y_A, pad_y_B), (pad_x_A, pad_x_B),
+                                 (0, 0)))
+
+    for k, d in info_dicts_A['bottom'].items():
         inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
         pred_map[(inst_y + d['bbox'][0][0] - min_y,
                     inst_x + d['bbox'][0][1] - min_x)] = \
                     d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
 
-    for k, d in top_info_dict_B.items():
+    for k, d in info_dicts_B['top'].items():
         inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
         pred_map[(inst_y + d['bbox'][0][0] - min_y,
                     inst_x + d['bbox'][0][1] - min_x)] = \
@@ -732,19 +756,36 @@ def _fix_ver_boundaries(inst_info_arr, nr_types=None):
 
     # Run the _post_process and get the dictionary for the individual
     # instances at the chunk boundaries
-    bound_inst_info_arr = _post_process(pred_map, nr_types=nr_types,
-                                        tl_pos=(min_y, min_x),
-                                        br_pos=(max_y, max_x),
-                                        check_sides_first=False,
-                                        ambiguous_size=0)
+    bound_inst_info_arr = _post_process(pred_map, block_id=(0, 0),
+                                        nr_types=nr_types,
+                                        offset=(min_y, min_x),
+                                        tile_shape=(max_y - min_y,
+                                                    max_x - min_x),
+                                        num_tiles=(1, 1),
+                                        check_sides_first=True,
+                                        ambiguous_size=ambiguous_size,
+                                        merge_edges=False)
 
-    inner_info_dict_A.update(bound_inst_info_arr[0, 0, 0])
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['top'])
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['bottom'])
 
-    inst_info_arr = np.array(
-        [[[inner_info_dict_A]], [[{}]], [[{}]],
-         [[{}]],
-         [[{}]],
-         [[{}]]])
+    if block_id[1] == 0:
+        info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['left'])
+    else:
+        info_dicts_A['left'].update(bound_inst_info_arr[0, 0]['left'])
+
+    if block_id[1] == num_tiles[1] - 1:
+        info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['right'])
+    else:
+        info_dicts_A['right'].update(bound_inst_info_arr[0, 0]['right'])
+
+    info_dicts_A['up'] = {}
+    info_dicts_A['bottom'] = {}
+    info_dicts_A['bound_pred_maps']['up'] = {}
+    info_dicts_A['bound_pred_maps']['bottom'] = {}
+
+    inst_info_arr = np.array([[info_dicts_A]])
 
     return inst_info_arr
 
@@ -1428,9 +1469,9 @@ class InferManagerDask(base.InferManager):
 
         self.wsi_inst_info = {}
 
-        # TODO: Process chunks/tiles/patches according to the mask generated
-        # above. If the mask is blank at that position, return a zero array
-        # instead of the network inference
+        # Process chunks/tiles/patches according to the mask generated above.
+        # If the mask is blank at that position, return a zero array instead of
+        # the network inference.
         offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
         z_wsi = da.from_zarr(self.wsi_handler._file_path,
                              component=self.method['data_group'] + '/0')
@@ -1478,57 +1519,52 @@ class InferManagerDask(base.InferManager):
                                               patch_output_shape,
                                               num_patches)]
 
-        post_z_wsi = []
-        for i in range(num_tiles[0]):
-            post_z_wsi.append([])
-            row_offset = i * tile_shape[0]
-            for j in range(num_tiles[1]):
-                col_offset = j * tile_shape[1]
-                res = dask.delayed(_post_process)(
-                    pred_z_wsi[row_offset:row_offset + tile_shape[0],
-                               col_offset:col_offset + tile_shape[1],
-                               :],
-                    nr_types=self.nr_types,
-                    tl_pos=(row_offset + offset, col_offset + offset),
-                    br_pos=(row_offset + tile_shape[0] + offset,
-                            col_offset + tile_shape[1] + offset),
-                    check_sides_first=True,
-                    ambiguous_size=ambiguous_size)
-                res = da.from_delayed(res, shape=(6, 1, 1),
-                                      dtype=np.object,
-                                      meta=np.empty((0), dtype=np.object))
-                post_z_wsi[-1].append(res)
+        pred_z_wsi = da.rechunk(pred_z_wsi, chunks=(tile_shape[0],
+                                                    tile_shape[1],
+                                                    4))
 
-        post_z_wsi = da.block(post_z_wsi)
-
-        # TODO: Handle edges of the image prior to processing overlaps
+        post_z_wsi = pred_z_wsi.map_blocks(
+            _post_process,
+            nr_types=self.nr_types,
+            offset=(offset, offset),
+            tile_shape=tile_shape,
+            num_tiles=num_tiles,
+            check_sides_first=False,
+            ambiguous_size=ambiguous_size,
+            dtype=np.object,
+            drop_axis=2,
+            chunks=(1, 1),
+            meta=np.empty((0), dtype=np.object)
+        )
 
         # Fix cells detected at chunk boundaries
         dict_pred_z_wsi = post_z_wsi.map_overlap(
-            _fix_hor_boundaries,
-            nr_types=self.nr_types,
+            _fix_ver_boundaries,
+            nr_types=self.nr_types,                        
+            num_tiles=num_tiles,
             ambiguous_size=ambiguous_size,
-            depth=((0, 0), (0, 0), (0, 1)),
+            depth=((0, 1), (0, 0)),
             boundary=None,
             trim=False,
-            dtype=np.object
+            dtype=np.object,
+            meta=np.empty((0), dtype=np.object)
         )
 
         dict_pred_z_wsi = dict_pred_z_wsi.map_overlap(
-            _fix_ver_boundaries,
+            _fix_hor_boundaries,
             nr_types=self.nr_types,
-            depth=((0, 0), (0, 1), (0, 0)),
+            depth=((0, 0), (0, 1)),
             boundary=None,
             trim=False,
-            dtype=np.object
+            dtype=np.object,
+            meta=np.empty((0), dtype=np.object)
         )
 
-        dask.config.set(scheduler='single-threaded')
         with ProgressBar():
             dicts = dict_pred_z_wsi.compute()
 
-        self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2},
-                                    list(dicts[0].flatten()),
+        self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2['inner']},
+                                    list(dicts.flatten()),
                                     {})
 
         all_keys = list(self.wsi_inst_info.keys())
