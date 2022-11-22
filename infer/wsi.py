@@ -393,17 +393,21 @@ def _infer_patch(patch, net, wsi_mag=40.0, scaled_wsi_mag=1.25):
     return pred_map
 
 
-def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None):
+def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None,
+                  check_sides_first=True,
+                  ambiguous_size=128):
     if tl_pos is None:
         tl_pos = (0, 0)
     if br_pos is None:
-        br_pos = (164, 164)
+        br_pos = (1640, 1640)
 
     inner_info_dict = {}
     left_info_dict = {}
     right_info_dict = {}
     top_info_dict = {}
     bottom_info_dict = {}
+
+    bound_pred_maps = dict(left=None, right=None, top=None, bottom=None)
 
     if pred_map[..., 0].sum() > 0:
         H, W = pred_map.shape[:2]
@@ -428,9 +432,8 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None):
             # TODO: chane format of bbox output
             rmin, rmax, cmin, cmax = get_bounding_box(inst_map)
             inst_bbox = np.array([[rmin, cmin], [rmax, cmax]])
-            inst_map = inst_map[
-                inst_bbox[0][0] : inst_bbox[1][0], inst_bbox[0][1] : inst_bbox[1][1]
-            ]
+            inst_map = inst_map[inst_bbox[0][0]:inst_bbox[1][0],
+                                inst_bbox[0][1]:inst_bbox[1][1]]
             inst_map = inst_map.astype(np.uint8)
             inst_moment = cv2.moments(inst_map)
             inst_contour = cv2.findContours(
@@ -455,9 +458,11 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None):
             inst_centroid[1] += inst_bbox[0][0] + tl_pos[0]  # Y
 
             if nr_types is not None:
-                inst_type_crop = pred_type[inst_bbox[0][0] : inst_bbox[1][0], inst_bbox[0][1] : inst_bbox[1][1]]
+                inst_type_crop = pred_type[inst_bbox[0][0]:inst_bbox[1][0],
+                                           inst_bbox[0][1]:inst_bbox[1][1]]
                 inst_type = inst_type_crop[np.nonzero(inst_map)]
-                type_list, type_pixels = np.unique(inst_type, return_counts=True)
+                type_list, type_pixels = np.unique(inst_type,
+                                                   return_counts=True)
                 type_list = list(zip(type_list, type_pixels))
                 type_list = sorted(type_list, key=lambda x: x[1], reverse=True)
                 inst_type = type_list[0][0]
@@ -477,9 +482,9 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None):
             bbox_br_y = inst_bbox[1][0]
 
             inst_bbox[0][1] += tl_pos[1] # X
-            inst_bbox[0][0] += tl_pos[0]  # Y
+            inst_bbox[0][0] += tl_pos[0] # Y
             inst_bbox[1][1] += tl_pos[1] # X
-            inst_bbox[1][0] += tl_pos[0]  # Y
+            inst_bbox[1][0] += tl_pos[0] # Y
 
             inst_info_dict = {
                     "bbox": inst_bbox.tolist(),
@@ -490,104 +495,256 @@ def _post_process(pred_map, nr_types=None, tl_pos=None, br_pos=None):
                 }
 
             inst_key = '%i,%i,%i,%i,%i' % (*tl_pos, *br_pos, inst_id)
-            inst_pred_map = pred_map[bbox_tl_y:bbox_br_y,
-                                     bbox_tl_x:bbox_br_x,
-                                     1:]
-            inst_pred_map = inst_pred_map * inst_map[..., np.newaxis]
 
-            if bbox_tl_x == 0:
-                left_info_dict[inst_key] = inst_info_dict
-                left_info_dict[inst_key]['pred_map'] = inst_pred_map
-            elif bbox_br_x == W - 1:
-                right_info_dict[inst_key] = inst_info_dict
-                right_info_dict[inst_key]['pred_map'] = inst_pred_map
-            elif bbox_tl_y == 0:
-                top_info_dict[inst_key] = inst_info_dict
-                top_info_dict[inst_key]['pred_map'] = inst_pred_map
-            elif bbox_br_y == H - 1:
-                bottom_info_dict[inst_key] = inst_info_dict
-                bottom_info_dict[inst_key]['pred_map'] = inst_pred_map
-            else:
-                inner_info_dict[inst_key] = inst_info_dict
+            info_dict = inner_info_dict
+            inst_pred_map = None
+
+            if ambiguous_size > 0:
+                # For objects detected at boundaries, save its corresponding
+                # prediction map. This cab be used in _fix_hor_boundaries and
+                # _fix_ver_boundaries to resolve ambiguities at chunk
+                # boundaries.
+                inst_pred_map = np.copy(pred_map[bbox_tl_y:bbox_br_y,
+                                                 bbox_tl_x:bbox_br_x,
+                                                 :])
+                inst_pred_map = np.concatenate((inst_pred_map,
+                                                inst_map[..., np.newaxis]),
+                                               axis=2)
+
+                if (bound_pred_maps['left'] is None
+                  or bound_pred_maps['right'] is None
+                  or bound_pred_maps['top'] is None
+                  or bound_pred_maps['bottom'] is None):
+                    bound_pred_maps['left'] = np.copy(
+                        pred_map[:, :ambiguous_size, :])
+                    bound_pred_maps['right'] = np.copy(
+                        pred_map[:, -ambiguous_size:, :])
+                    bound_pred_maps['top'] = np.copy(
+                        pred_map[:ambiguous_size, :, :])
+                    bound_pred_maps['bottom'] = np.copy(
+                        pred_map[-ambiguous_size:, :, :])
+
+                if check_sides_first:
+                    if bbox_tl_x < ambiguous_size:
+                        info_dict = left_info_dict
+                    elif bbox_br_x >= W - ambiguous_size:
+                        info_dict = right_info_dict
+                    elif bbox_tl_y < ambiguous_size:
+                        info_dict = top_info_dict
+                    elif bbox_br_y >= H - ambiguous_size:
+                        info_dict = bottom_info_dict
+                    else:
+                        inst_pred_map = None
+                else:
+                    if bbox_tl_y < ambiguous_size:
+                        info_dict = top_info_dict
+                    elif bbox_br_y >= H - ambiguous_size:
+                        info_dict = bottom_info_dict
+                    elif bbox_tl_x < ambiguous_size:
+                        info_dict = left_info_dict
+                    elif bbox_br_x >= W - ambiguous_size:
+                        info_dict = right_info_dict
+                    else:
+                        inst_pred_map = None
+
+            info_dict[inst_key] = inst_info_dict
+            info_dict[inst_key]['pred_map'] = inst_pred_map
 
     inst_info_arr = np.array([[[inner_info_dict]], [[left_info_dict]],
                               [[right_info_dict]],
                               [[top_info_dict]],
-                              [[bottom_info_dict]]])
+                              [[bottom_info_dict]],
+                              [[bound_pred_maps]]])
 
     return inst_info_arr
 
 
-def _fix_hor_boundaries(inst_info_arr):
+def _fix_hor_boundaries(inst_info_arr, nr_types=None, ambiguous_size=128):
     (inner_info_dict_A,
      left_info_dict_A,
      right_info_dict_A,
      top_info_dict_A,
-     bottom_info_dict_A) = inst_info_arr[:, 0, 0]
+     bottom_info_dict_A,
+     bound_pred_maps_A) = inst_info_arr[:, 0, 0]
 
-    if inst_info_arr.shape[2] == 1:
+    chunk_info = reduce(lambda l1, l2: l1 + list(l2.keys()),
+                        inst_info_arr[:-1, 0, 0],
+                        [])
+
+    if inst_info_arr.shape[2] == 1 or len(chunk_info) == 0:
         return inst_info_arr[..., :1]
 
     left_info_dict_B = inst_info_arr[1, 0, 1]
+    bound_pred_maps_B = inst_info_arr[5, 0, 1]
 
-    if len(left_info_dict_B) == 0:
-        # If there are no objects detected on the left edge of chunk B, move
-        # all objects at the right edge of chunk A, except those at its top or
-        # bottom edge, to the inner object dictionary.
-        for k, d in right_info_dict_A.items():
-            tl_pos = list(map(int, k.split(',')[:2]))
-            br_pos = list(map(int, k.split(',')[2:4]))
+    chunk_info = list(map(int, chunk_info[0].split(',')))
+    tl_pos = chunk_info[:2]
+    br_pos = chunk_info[2:4]
 
-            if d['bbox'][0][0] == tl_pos[0]:
-                top_info_dict_A[k] = d
-            elif d['bbox'][1][1] == br_pos[0]:
-                bottom_info_dict_A[k] = d
-            else:
-                inner_info_dict_A[k] = d
+    if bound_pred_maps_B['left'] is not None:
+        pred_map = np.hstack((bound_pred_maps_A['right'],
+                              bound_pred_maps_B['left']))
+    else:
+        pred_map = np.vstack((bound_pred_maps_A['right'],
+                              np.zeros_like(bound_pred_maps_A['right'])))
 
-    elif len(right_info_dict_A) > 0:
-        chunk_info = list(map(int,
-                              list(right_info_dict_A.keys())[0].split(',')))
-        tl_pos = chunk_info[:2]
-        br_pos = chunk_info[2:4]
-        min_x_A = min(map(lambda d: d[1]['bbox'][0][1],
-                          right_info_dict_A.items()))
-        max_x_B = max(map(lambda d: d[1]['bbox'][1][1],
-                          left_info_dict_B.items()))
+    pred_map_tl = (tl_pos[0], br_pos[1] - pred_map.shape[1] // 2)
 
-        min_y_A = min(map(lambda d: d[1]['bbox'][0][0],
-                          right_info_dict_A.items()))
-        min_y_B = min(map(lambda d: d[1]['bbox'][0][0],
-                          left_info_dict_B.items()))
+    pred_map_br = (pred_map_tl[0] + pred_map.shape[0],
+                   pred_map_tl[1] + pred_map.shape[1])
 
-        max_y_A = max(map(lambda d: d[1]['bbox'][1][0],
-                          right_info_dict_A.items()))
-        max_y_B = max(map(lambda d: d[1]['bbox'][1][0],
-                          left_info_dict_B.items()))
+    min_x = min(map(lambda d: d[1]['bbox'][0][1],
+                    right_info_dict_A.items()),
+                default=pred_map_tl[1])
 
-        min_y = min(min_y_A, min_y_B)
-        max_y = max(max_y_A, max_y_B)
+    min_x = min(min_x, pred_map_tl[1])
 
-        pred_map = np.zeros((max_y - min_y + 1,
-                             max_x_B - min_x_A + 1,
-                             3),
-                            dtype=np.float32)
+    max_x = max(map(lambda d: d[1]['bbox'][1][1],
+                    left_info_dict_B.items()),
+                default=pred_map_br[1])
 
-        for k, d in right_info_dict_A.items():
-            pred_map[d['bbox'][0][0] - min_y:d['bbox'][1][0] - min_y,
-                     d['bbox'][0][1] - min_x_A:d['bbox'][1][1] - min_x_A,
-                     :] = d['pred_map']
-        for k, d in left_info_dict_B.items():
-            pred_map[d['bbox'][0][0] - min_y:d['bbox'][1][0] - min_y,
-                     d['bbox'][0][1] - min_x_A:d['bbox'][1][1] - min_x_A,
-                     :] = d['pred_map']
+    max_x = max(max_x, pred_map_br[1])
 
-        # TODO: Run the _proc_np_hv function to the the individual instances
+    pad_x_A = pred_map_tl[1] - min_x
+    pad_x_B = max_x - pred_map_br[1]
+
+    pred_map = np.pad(pred_map, ((0, 0), (pad_x_A, pad_x_B), (0, 0)))
+
+    for k, d in right_info_dict_A.items():
+        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
+        pred_map[(inst_y + d['bbox'][0][0] - tl_pos[0],
+                    inst_x + d['bbox'][0][1] - min_x)] = \
+                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+
+    for k, d in left_info_dict_B.items():
+        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
+        pred_map[(inst_y + d['bbox'][0][0] - tl_pos[0],
+                    inst_x + d['bbox'][0][1] - min_x)] = \
+                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+
+    # Run the _post_process and get the dictionary for the individual
+    # instances at the chunk boundaries
+    bound_inst_info_arr = _post_process(pred_map, nr_types=nr_types,
+                                        tl_pos=(tl_pos[0], min_x),
+                                        br_pos=(br_pos[0], max_x),
+                                        check_sides_first=False,
+                                        ambiguous_size=ambiguous_size)
+
+    inner_info_dict_A.update(bound_inst_info_arr[0, 0, 0])
+    inner_info_dict_A.update(bound_inst_info_arr[1, 0, 0])
+    inner_info_dict_A.update(bound_inst_info_arr[2, 0, 0])
+    top_info_dict_A.update(bound_inst_info_arr[3, 0, 0])
+    bottom_info_dict_A.update(bound_inst_info_arr[4, 0, 0])
 
     inst_info_arr = np.array(
         [[[inner_info_dict_A]], [[left_info_dict_A]], [[{}]],
          [[top_info_dict_A]],
-         [[bottom_info_dict_A]]])
+         [[bottom_info_dict_A]],
+         [[dict(top=bound_pred_maps_A['top'],
+                bottom=bound_pred_maps_A['bottom'])]]])
+
+    return inst_info_arr
+
+
+def _fix_ver_boundaries(inst_info_arr, nr_types=None):
+    (inner_info_dict_A,
+     left_info_dict_A,
+     right_info_dict_A,
+     top_info_dict_A,
+     bottom_info_dict_A,
+     bound_pred_maps_A) = inst_info_arr[:, 0, 0]
+
+    chunk_info = reduce(lambda l1, l2: l1 + list(l2.keys()),
+                        inst_info_arr[:-1, 0, 0],
+                        [])
+
+    if inst_info_arr.shape[1] == 1 or len(chunk_info) == 0:
+        # Tile A does not contain any object, or tile B is empty
+        return inst_info_arr[..., :1, :]
+
+    top_info_dict_B = inst_info_arr[3, 1, 0]
+    bound_pred_maps_B = inst_info_arr[5, 1, 0]
+
+    chunk_info = list(map(int, chunk_info[0].split(',')))
+    tl_pos = chunk_info[:2]
+    br_pos = chunk_info[2:4]
+
+    if bound_pred_maps_B['top'] is not None:
+        pred_map = np.vstack((bound_pred_maps_A['bottom'],
+                              bound_pred_maps_B['top']))
+    else:
+        pred_map = np.vstack((bound_pred_maps_A['bottom'],
+                              np.zeros_like(bound_pred_maps_A['bottom'])))
+
+    pred_map_tl = (br_pos[0] - pred_map.shape[0] // 2,
+                    tl_pos[1] + (br_pos[1] - tl_pos[1] - pred_map.shape[1]) // 2)
+    pred_map_br = (pred_map_tl[0] + pred_map.shape[0],
+                    pred_map_tl[1] + pred_map.shape[1])
+    
+    min_y = min(map(lambda d: d[1]['bbox'][0][0],
+                    bottom_info_dict_A.items()),
+                default=pred_map_tl[0])
+    min_y = min(min_y, pred_map_tl[0])
+
+    max_y = max(map(lambda d: d[1]['bbox'][1][0],
+                    top_info_dict_B.items()),
+                default=pred_map_br[0])
+    max_y = max(max_y, pred_map_br[0])
+
+    min_x_A = min(map(lambda d: d[1]['bbox'][0][1],
+                      bottom_info_dict_A.items()),
+                  default=pred_map_tl[1])
+                  
+    min_x_B = min(map(lambda d: d[1]['bbox'][0][1],
+                      top_info_dict_B.items()),
+                  default=pred_map_tl[1])
+
+    min_x = min(min_x_A, min_x_B, pred_map_tl[1])
+
+    max_x_A = max(map(lambda d: d[1]['bbox'][1][1],
+                      bottom_info_dict_A.items()),
+                  default=pred_map_br[1])
+
+    max_x_B = max(map(lambda d: d[1]['bbox'][1][1],
+                      top_info_dict_B.items()),
+                  default=pred_map_br[1])
+
+    max_x = max(max_x_A, max_x_B, pred_map_br[1])
+
+    pad_y_A = pred_map_tl[0] - min_y
+    pad_x_A = pred_map_tl[1] - min_x
+    pad_y_B = max_y - pred_map_br[0]
+    pad_x_B = max_x - pred_map_br[1]
+
+    pred_map = np.pad(pred_map, ((pad_y_A, pad_y_B), (pad_x_A, pad_x_B), (0, 0)))
+
+    for k, d in bottom_info_dict_A.items():
+        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
+        pred_map[(inst_y + d['bbox'][0][0] - min_y,
+                    inst_x + d['bbox'][0][1] - min_x)] = \
+                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+
+    for k, d in top_info_dict_B.items():
+        inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
+        pred_map[(inst_y + d['bbox'][0][0] - min_y,
+                    inst_x + d['bbox'][0][1] - min_x)] = \
+                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+
+    # Run the _post_process and get the dictionary for the individual
+    # instances at the chunk boundaries
+    bound_inst_info_arr = _post_process(pred_map, nr_types=nr_types,
+                                        tl_pos=(min_y, min_x),
+                                        br_pos=(max_y, max_x),
+                                        check_sides_first=False,
+                                        ambiguous_size=0)
+
+    inner_info_dict_A.update(bound_inst_info_arr[0, 0, 0])
+
+    inst_info_arr = np.array(
+        [[[inner_info_dict_A]], [[{}]], [[{}]],
+         [[{}]],
+         [[{}]],
+         [[{}]]])
 
     return inst_info_arr
 
@@ -1193,100 +1350,11 @@ class InferManager(base.InferManager):
 
 ####
 class InferManagerDask(base.InferManager):
-    def __save_json(self, path, info_dict, mag=None):
+    def _save_json(self, path, info_dict, mag=None):
         json_dict = {"mag": mag, "nuc": info_dict}  # to sync the format protocol
         with open(path, "w") as handle:
             json.dump(json_dict, handle)
         return info_dict
-
-    def __select_valid_patches(self, patch_info_list, has_output_info=True):
-        """Select valid patches from the list of input patch information.
-
-        Args:
-            patch_info_list: patch input coordinate information
-            has_output_info: whether output information is given
-        
-        """
-        down_sample_ratio = self.wsi_mask.shape[0] / self.wsi_proc_shape[0]
-        selected_indices = []
-        for idx in range(patch_info_list.shape[0]):
-            patch_info = patch_info_list[idx]
-            patch_info = np.squeeze(patch_info)
-            # get the box at corresponding mag of the mask
-            if has_output_info:
-                output_bbox = patch_info[1] * down_sample_ratio
-            else:
-                output_bbox = patch_info * down_sample_ratio
-            output_bbox = np.rint(output_bbox).astype(np.int64)
-            # coord of the output of the patch (i.e center regions)
-            output_roi = self.wsi_mask[
-                output_bbox[0][0] : output_bbox[1][0],
-                output_bbox[0][1] : output_bbox[1][1],
-            ]
-            if np.sum(output_roi) > 0:
-                selected_indices.append(idx)
-        sub_patch_info_list = patch_info_list[selected_indices]
-        return sub_patch_info_list
-
-    def __dispatch_post_processing(self, tile_info_list, callback):
-        """Post processing initialisation."""
-        proc_pool = None
-        if self.nr_post_proc_workers > 0:
-            proc_pool = ProcessPoolExecutor(self.nr_post_proc_workers)
-
-        future_list = []
-        if (hasattr(self.wsi_handler.file_ptr, 'store')
-           and '.zarr' in self.wsi_handler.file_ptr.store.path):
-            wsi_pred_map_mmap_path = "%s/pred_map.zarr" % self.cache_path
-            post_proc_wrapper_fun = _post_proc_para_wrapper_zarr
-        else:
-            wsi_pred_map_mmap_path = "%s/pred_map.npy" % self.cache_path
-            post_proc_wrapper_fun = _post_proc_para_wrapper
-        for idx in list(range(tile_info_list.shape[0])):
-            tile_tl = tile_info_list[idx][0]
-            tile_br = tile_info_list[idx][1]
-
-            tile_info = (idx, tile_tl, tile_br)
-            func_kwargs = {
-                "nr_types": self.method["model_args"]["nr_types"],
-                "return_centroids": True,
-            }
-
-            # TODO: standarize protocol
-            if proc_pool is not None:
-                proc_future = proc_pool.submit(
-                    post_proc_wrapper_fun,
-                    wsi_pred_map_mmap_path,
-                    tile_info,
-                    self.post_proc_func,
-                    func_kwargs,
-                )
-
-                # ! manually poll future and call callback later as there is no guarantee
-                # ! that the callback is called from main thread
-                future_list.append(proc_future)
-            else:
-                results = post_proc_wrapper_fun(
-                    wsi_pred_map_mmap_path, tile_info, self.post_proc_func, func_kwargs
-                )
-                callback(results)
-        if proc_pool is not None:
-            silent_crash = False
-            # loop over all to check state a.k.a polling
-            for future in as_completed(future_list):
-                # ! silent crash, cancel all and raise error
-                if future.exception() is not None:
-                    silent_crash = True
-                    # ! cancel somehow leads to cascade error later
-                    # ! so just poll it then crash once all future
-                    # ! acquired for now
-                    # for future in future_list:
-                    #     future.cancel()
-                    # break
-                else:
-                    callback(future.result())
-            assert not silent_crash
-        return
 
     def _parse_args(self, run_args):
         """Parse command line arguments and set as instance variables."""
@@ -1396,23 +1464,60 @@ class InferManagerDask(base.InferManager):
                     wsi_mag=self.wsi_handler.metadata["base_mag"],
                     scaled_wsi_mag=1.25)
 
+                res = da.from_delayed(res, shape=(patch_output_shape[0], 
+                                                  patch_output_shape[1],
+                                                  4),
+                                      dtype=np.object,
+                                      meta=np.empty((0), dtype=np.float32))
+                pred_z_wsi[-1].append(res)
+            pred_z_wsi[-1] = da.hstack(pred_z_wsi[-1])
+        pred_z_wsi = da.vstack(pred_z_wsi)
+
+        num_tiles = [int(math.ceil(o_p / t_p * n_p))
+                     for t_p, o_p, n_p in zip(tile_shape,
+                                              patch_output_shape,
+                                              num_patches)]
+
+        post_z_wsi = []
+        for i in range(num_tiles[0]):
+            post_z_wsi.append([])
+            row_offset = i * tile_shape[0]
+            for j in range(num_tiles[1]):
+                col_offset = j * tile_shape[1]
                 res = dask.delayed(_post_process)(
-                    res,
+                    pred_z_wsi[row_offset:row_offset + tile_shape[0],
+                               col_offset:col_offset + tile_shape[1],
+                               :],
                     nr_types=self.nr_types,
                     tl_pos=(row_offset + offset, col_offset + offset),
-                    br_pos=(row_offset + patch_output_shape[0] + offset - 1,
-                            col_offset + patch_output_shape[1] + offset - 1))
-
-                res = da.from_delayed(res, shape=(5, 1, 1),
+                    br_pos=(row_offset + tile_shape[0] + offset,
+                            col_offset + tile_shape[1] + offset),
+                    check_sides_first=True,
+                    ambiguous_size=ambiguous_size)
+                res = da.from_delayed(res, shape=(6, 1, 1),
                                       dtype=np.object,
                                       meta=np.empty((0), dtype=np.object))
-                pred_z_wsi[-1].append(res)
+                post_z_wsi[-1].append(res)
 
-        pred_z_wsi = da.block(pred_z_wsi)
+        post_z_wsi = da.block(post_z_wsi)
 
-        dict_pred_z_wsi = pred_z_wsi.map_overlap(
+        # TODO: Handle edges of the image prior to processing overlaps
+
+        # Fix cells detected at chunk boundaries
+        dict_pred_z_wsi = post_z_wsi.map_overlap(
             _fix_hor_boundaries,
+            nr_types=self.nr_types,
+            ambiguous_size=ambiguous_size,
             depth=((0, 0), (0, 0), (0, 1)),
+            boundary=None,
+            trim=False,
+            dtype=np.object
+        )
+
+        dict_pred_z_wsi = dict_pred_z_wsi.map_overlap(
+            _fix_ver_boundaries,
+            nr_types=self.nr_types,
+            depth=((0, 0), (0, 1), (0, 0)),
             boundary=None,
             trim=False,
             dtype=np.object
@@ -1429,6 +1534,7 @@ class InferManagerDask(base.InferManager):
         all_keys = list(self.wsi_inst_info.keys())
         for i, k in enumerate(all_keys):
             self.wsi_inst_info[i+1] = self.wsi_inst_info.pop(k)
+            del(self.wsi_inst_info[i+1]['pred_map'])
 
         # ! cant possibly save the inst map at high res, too large
         start = time.perf_counter()
@@ -1436,7 +1542,7 @@ class InferManagerDask(base.InferManager):
             json_path = "%s/json/%s.json" % (output_dir, wsi_name)
         else:
             json_path = "%s/%s.json" % (output_dir, wsi_name)
-        self.__save_json(json_path, self.wsi_inst_info, mag=self.proc_mag)
+        self._save_json(json_path, self.wsi_inst_info, mag=self.proc_mag)
         end = time.perf_counter()
         log_info("Save Time: {0}".format(end - start))
 
