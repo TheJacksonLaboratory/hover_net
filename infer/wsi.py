@@ -362,7 +362,7 @@ def _proc_np_hv(pred_inst):
     return pred_inst
 
 
-def _infer_patch(patch, net, wsi_mag=40.0, scaled_wsi_mag=1.25):
+def _infer_patch(patch, net, block_id=None, wsi_mag=40.0, scaled_wsi_mag=1.25):
     scale_factor = scaled_wsi_mag / wsi_mag
     # now rescale then return
     if scale_factor > 1.0:
@@ -1478,46 +1478,46 @@ class InferManagerDask(base.InferManager):
 
         self.wsi_proc_shape = self.wsi_handler.get_dimensions(self.proc_mag)
         self.wsi_proc_shape = self.wsi_proc_shape[::-1]
+
         num_patches = [int(math.ceil(s / p))
                        for s, p in zip(self.wsi_proc_shape,
                                        patch_output_shape)]
-
-        paddings = [(0, 0), (0, 0), (0, 0)]
-        paddings += [(0, n_p * p - s + 2 * offset)
-                     for s, p, n_p in zip(self.wsi_proc_shape,
-                                          patch_output_shape,
-                                          num_patches)]
-
-        padded_z_wsi = da.pad(z_wsi, paddings, mode='constant')
-        padded_z_wsi = padded_z_wsi.rechunk((1, 3, 1, patch_output_shape[0],
-                                             patch_output_shape[1]))
-        pred_z_wsi = []
-        for i in range(num_patches[0]):
-            pred_z_wsi.append([])
-            row_offset = i * patch_output_shape[0]
-            for j in range(num_patches[1]):
-                col_offset = j * patch_output_shape[1]
-                res = dask.delayed(_infer_patch)(
-                    padded_z_wsi[...,
-                                 row_offset:row_offset + patch_input_shape[0],
-                                 col_offset:col_offset + patch_input_shape[1]],
-                    net=self.run_step,
-                    wsi_mag=self.wsi_handler.metadata["base_mag"],
-                    scaled_wsi_mag=1.25)
-
-                res = da.from_delayed(res, shape=(patch_output_shape[0], 
-                                                  patch_output_shape[1],
-                                                  4),
-                                      dtype=np.object,
-                                      meta=np.empty((0), dtype=np.float32))
-                pred_z_wsi[-1].append(res)
-            pred_z_wsi[-1] = da.hstack(pred_z_wsi[-1])
-        pred_z_wsi = da.vstack(pred_z_wsi)
 
         num_tiles = [int(math.ceil(o_p / t_p * n_p))
                      for t_p, o_p, n_p in zip(tile_shape,
                                               patch_output_shape,
                                               num_patches)]
+
+        paddings = [(0, 0), (0, 0), (0, 0)]
+        paddings += [(0, n_p * p - s)
+                     for s, p, n_p in zip(self.wsi_proc_shape,
+                                          patch_output_shape,
+                                          num_patches)]
+
+        padded_z_wsi = da.pad(z_wsi, paddings, mode='constant')
+
+        # Perform an intermediate rechunking
+        int_rechunks = min(s // p
+                           for s, p in zip(self.wsi_proc_shape,
+                                           patch_output_shape))
+        for int_scale in reversed(range(int_rechunks)):
+            padded_z_wsi = padded_z_wsi.rechunk(
+                (1, 3, 1, patch_output_shape[0] * (int_scale + 1),
+                          patch_output_shape[1]) * (int_scale + 1))
+
+        pred_z_wsi = padded_z_wsi.map_overlap(
+            _infer_patch,
+            net=self.run_step,
+            wsi_mag=self.wsi_handler.metadata["base_mag"],
+            scaled_wsi_mag=1.25,
+            depth=(0, 0, 0, offset, offset),
+            boundary=0,
+            trim=False,
+            dtype=np.float32,
+            drop_axis=(0, 1, 2),
+            new_axis=2,
+            chunks=(patch_output_shape[0], patch_output_shape[1], 4),
+            meta=np.empty((0), dtype=np.float32))
 
         pred_z_wsi = da.rechunk(pred_z_wsi, chunks=(tile_shape[0],
                                                     tile_shape[1],
@@ -1526,7 +1526,7 @@ class InferManagerDask(base.InferManager):
         post_z_wsi = pred_z_wsi.map_blocks(
             _post_process,
             nr_types=self.nr_types,
-            offset=(offset, offset),
+            offset=(0, 0),
             tile_shape=tile_shape,
             num_tiles=num_tiles,
             check_sides_first=False,
