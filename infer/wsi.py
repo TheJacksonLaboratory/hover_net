@@ -1496,14 +1496,8 @@ class InferManagerDask(base.InferManager):
 
         padded_z_wsi = da.pad(z_wsi, paddings, mode='constant')
 
-        # Perform an intermediate rechunking
-        int_rechunks = min(s // p
-                           for s, p in zip(self.wsi_proc_shape,
-                                           patch_output_shape))
-        for int_scale in reversed(range(int_rechunks)):
-            padded_z_wsi = padded_z_wsi.rechunk(
-                (1, 3, 1, patch_output_shape[0] * (int_scale + 1),
-                          patch_output_shape[1]) * (int_scale + 1))
+        padded_z_wsi = padded_z_wsi.rechunk(
+            (1, 3, 1, patch_output_shape[0], patch_output_shape[1]))
 
         pred_z_wsi = padded_z_wsi.map_overlap(
             _infer_patch,
@@ -1519,9 +1513,7 @@ class InferManagerDask(base.InferManager):
             chunks=(patch_output_shape[0], patch_output_shape[1], 4),
             meta=np.empty((0), dtype=np.float32))
 
-        pred_z_wsi = da.rechunk(pred_z_wsi, chunks=(tile_shape[0],
-                                                    tile_shape[1],
-                                                    4))
+        pred_z_wsi = pred_z_wsi.rechunk((tile_shape[0], tile_shape[1], 4))
 
         post_z_wsi = pred_z_wsi.map_blocks(
             _post_process,
