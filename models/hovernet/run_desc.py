@@ -168,20 +168,21 @@ def valid_step(batch_data, run_info):
 
 
 ####
-def infer_step(batch_data, model):
+def infer_step(batch_data, model, idx=0):
 
     ####
     patch_imgs = batch_data
 
-    patch_imgs_gpu = patch_imgs.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.float32)  # to NCHW
-    patch_imgs_gpu = patch_imgs_gpu.permute(0, 3, 1, 2).contiguous()
+    # patch_imgs_gpu = patch_imgs_gpu.permute(0, 3, 1, 2).contiguous()
+    # patch_imgs_gpu = patch_imgs.to("cuda" if torch.cuda.is_available() else "cpu").type(torch.float32)  # to NCHW
+    patch_imgs_gpu = patch_imgs.permute(0, 3, 1, 2).contiguous()
 
     ####
-    model.eval()  # infer mode
+    model[idx].eval()  # infer mode
 
     # --------------------------------------------------------------
     with torch.no_grad():  # dont compute gradient
-        pred_dict = model(patch_imgs_gpu)
+        pred_dict = model[idx](patch_imgs_gpu)
         pred_dict = OrderedDict(
             [[k, v.permute(0, 2, 3, 1).contiguous()] for k, v in pred_dict.items()]
         )

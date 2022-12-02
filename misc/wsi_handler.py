@@ -5,8 +5,6 @@ import numpy as np
 import os
 import zarr
 import ome_types
-
-os.add_dll_directory("C:/Users/cervaf/Documents/Apps/openslide/bin")
 import openslide
 
 

@@ -72,18 +72,19 @@ class InferManager(object):
         model_desc = import_module("models.hovernet.net_desc")
         model_creator = getattr(model_desc, "create_model")
 
-        net = model_creator(**self.method["model_args"])
-        saved_state_dict = torch.load(self.method["model_path"], map_location=None if torch.cuda.is_available() else 'cpu')["desc"]
-        saved_state_dict = convert_pytorch_checkpoint(saved_state_dict)
+        self.available_gpus_ids = [int(device) for device in os.environ['CUDA_VISIBLE_DEVICES'].split(',')]
+        net = []
+        for g in range(max(1, torch.cuda.device_count())):
+            net.append(model_creator(**self.method["model_args"]))
+            saved_state_dict = torch.load(self.method["model_path"], map_location=None if torch.cuda.is_available() else 'cpu')["desc"]
+            saved_state_dict = convert_pytorch_checkpoint(saved_state_dict)
 
-        net.load_state_dict(saved_state_dict, strict=True)
-        net = torch.nn.DataParallel(net)
-        if torch.cuda.is_available():
-            net = net.to("cuda")
+            net[-1].load_state_dict(saved_state_dict, strict=True)
+            if torch.cuda.is_available():
+                net[-1].to("cuda:%i" % self.available_gpus_ids[g])
+            net[-1].eval()
 
-        module_lib = import_module("models.hovernet.run_desc")
-        run_step = getattr(module_lib, "infer_step")
-        self.run_step = lambda input_batch: run_step(input_batch, net)
+        self.run_step = net
 
         module_lib = import_module("models.hovernet.post_proc")
         self.post_proc_func = getattr(module_lib, "process")
