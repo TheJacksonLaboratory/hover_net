@@ -151,14 +151,20 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
                   check_sides_first=True,
                   ambiguous_size=128,
                   merge_edges=True):
+    H, W = pred_map.shape[:2]
     tl_pos = (block_id[0] * tile_shape[0] + offset[0],
               block_id[1] * tile_shape[1] + offset[1])
-    br_pos = (tl_pos[0] + tile_shape[0], tl_pos[1] + tile_shape[1])
+    br_pos = (tl_pos[0] + H, tl_pos[1] + W)
 
     merge_edges_top = block_id[0] == 0 and merge_edges
     merge_edges_bottom = block_id[0] == num_tiles[0] - 1 and merge_edges
     merge_edges_left = block_id[1] == 0 and merge_edges
     merge_edges_right = block_id[1] == num_tiles[1] - 1 and merge_edges
+
+    # Add a correction offset to the ambiguous prediction maps according to the
+    # priority (sides first or not)
+    corr_ver = 0 if check_sides_first else ambiguous_size
+    corr_hor = ambiguous_size if check_sides_first else 0
 
     info_dicts = dict(
         tl_pos=tl_pos,
@@ -170,21 +176,19 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
         bottom={},
         bound_pred_maps=dict(
             left=None,
-            left_tl_pos=(tl_pos[0], tl_pos[1]),
-            left_br_pos=(br_pos[0], tl_pos[1] + ambiguous_size),
+            left_tl_pos=(tl_pos[0] + corr_ver, tl_pos[1]),
+            left_br_pos=(br_pos[0] - corr_ver, tl_pos[1] + ambiguous_size),
             right=None,
-            right_tl_pos=(tl_pos[0], br_pos[1] - ambiguous_size),
-            right_br_pos=(br_pos[0], br_pos[1]),
+            right_tl_pos=(tl_pos[0] + corr_ver, br_pos[1] - ambiguous_size),
+            right_br_pos=(br_pos[0] - corr_ver, br_pos[1]),
             top=None,
-            top_tl_pos=(tl_pos[0], tl_pos[1]),
-            top_br_pos=(tl_pos[0] + ambiguous_size, br_pos[1]),
+            top_tl_pos=(tl_pos[0], tl_pos[1] + corr_hor),
+            top_br_pos=(tl_pos[0] + ambiguous_size, br_pos[1] - corr_hor),
             bottom=None,
-            bottom_tl_pos=(br_pos[0] - ambiguous_size, tl_pos[1]),
-            bottom_br_pos=(br_pos[0], br_pos[1])))
+            bottom_tl_pos=(br_pos[0] - ambiguous_size, tl_pos[1] + corr_hor),
+            bottom_br_pos=(br_pos[0], br_pos[1] - corr_hor)))
 
     if pred_map[..., 0].sum() > 0:
-        H, W = pred_map.shape[:2]
-
         if nr_types is not None:
             pred_type = pred_map[..., 0]
             pred_inst = pred_map[..., 1:]
@@ -195,31 +199,18 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
         pred_inst = np.squeeze(pred_inst)
         pred_inst = _proc_np_hv(pred_inst)
 
-        if not merge_edges_left and ambiguous_size > 0:
-            info_dicts['bound_pred_maps']['left'] = np.copy(
-                pred_map[:, :ambiguous_size, :])
-        if not merge_edges_right and ambiguous_size > 0:
-            info_dicts['bound_pred_maps']['right'] = np.copy(
-                pred_map[:, -ambiguous_size:, :])
-        if not merge_edges_top and ambiguous_size > 0:
-            info_dicts['bound_pred_maps']['top'] = np.copy(
-                pred_map[:ambiguous_size, :, :])
-        if not merge_edges_bottom and ambiguous_size > 0:
-            info_dicts['bound_pred_maps']['bottom'] = np.copy(
-                pred_map[-ambiguous_size:, :, :])
-
         inst_id_list = np.unique(pred_inst)
         for inst_id in inst_id_list:
             if inst_id == 0:
                 # Ignore background
                 continue
 
-            inst_map = pred_inst == inst_id
+            inst_map_full = pred_inst == inst_id
             # TODO: chane format of bbox output
-            rmin, rmax, cmin, cmax = get_bounding_box(inst_map)
+            rmin, rmax, cmin, cmax = get_bounding_box(inst_map_full)
             inst_bbox = np.array([[rmin, cmin], [rmax, cmax]])
-            inst_map = inst_map[inst_bbox[0][0]:inst_bbox[1][0],
-                                inst_bbox[0][1]:inst_bbox[1][1]]
+            inst_map = inst_map_full[inst_bbox[0][0]:inst_bbox[1][0],
+                                     inst_bbox[0][1]:inst_bbox[1][1]]
             inst_map = inst_map.astype(np.uint8)
             inst_moment = cv2.moments(inst_map)
             inst_contour = cv2.findContours(
@@ -297,6 +288,9 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
                                                 inst_map[..., np.newaxis]),
                                                axis=2)
 
+                # Delete the instance from the prediction map
+                pred_map[(*np.nonzero(inst_map_full), slice(0, 4, 1))] = 0
+
                 if check_sides_first:
                     if (bbox_tl_x < ambiguous_size
                       and not merge_edges_left):
@@ -331,12 +325,27 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
             info_dicts[info_dict_key][inst_key] = inst_info_dict
             info_dicts[info_dict_key][inst_key]['pred_map'] = inst_pred_map
 
+        # Move the remaining ambiguous prediction map for fixing chunk
+        # boundaries in the next step.
+        if not merge_edges_left and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['left'] = np.copy(
+                pred_map[corr_ver:H - corr_ver, :ambiguous_size, :])
+        if not merge_edges_right and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['right'] = np.copy(
+                pred_map[corr_ver:H - corr_ver, -ambiguous_size:, :])
+        if not merge_edges_top and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['top'] = np.copy(
+                pred_map[:ambiguous_size, corr_hor:W - corr_hor, :])
+        if not merge_edges_bottom and ambiguous_size > 0:
+            info_dicts['bound_pred_maps']['bottom'] = np.copy(
+                pred_map[-ambiguous_size:, corr_hor:W - corr_hor, :])
+
     inst_info_arr = np.array([[info_dicts]])
 
     return inst_info_arr
 
 
-def _fix_hor_boundaries(inst_info_arr, nr_types=None):
+def _fix_hor_boundaries(inst_info_arr, block_id=None, nr_types=None):
     info_dicts_A = inst_info_arr[0, 0]
 
     if inst_info_arr.shape[1] == 1:
@@ -356,42 +365,48 @@ def _fix_hor_boundaries(inst_info_arr, nr_types=None):
         pred_map = np.hstack(
             (info_dicts_A['bound_pred_maps']['right'],
              info_dicts_B['bound_pred_maps']['left']))
+
+        pred_map_tl = info_dicts_A['bound_pred_maps']['right_tl_pos']
+        pred_map_br = info_dicts_B['bound_pred_maps']['left_br_pos']
+
     elif info_dicts_A['bound_pred_maps']['right'] is not None:
-        pred_map = np.hstack(
-            (info_dicts_A['bound_pred_maps']['right'],
-             np.zeros_like(info_dicts_A['bound_pred_maps']['right'])))
+        pred_map = info_dicts_A['bound_pred_maps']['right']
+
+        pred_map_tl = info_dicts_A['bound_pred_maps']['right_tl_pos']
+        pred_map_br = info_dicts_A['bound_pred_maps']['right_br_pos']
+
     elif info_dicts_B['bound_pred_maps']['left'] is not None:
-        pred_map = np.hstack(
-            (np.zeros_like(info_dicts_B['bound_pred_maps']['left']),
-             info_dicts_B['bound_pred_maps']['left']))
+        pred_map = info_dicts_B['bound_pred_maps']['left']
+
+        pred_map_tl = info_dicts_B['bound_pred_maps']['left_tl_pos']
+        pred_map_br = info_dicts_B['bound_pred_maps']['left_br_pos']
+
     else:
+        # If both chunks are empty, return chunk A as it is
         return inst_info_arr[:, :1]
 
-    pred_map_tl = info_dicts_A['bound_pred_maps']['right_tl_pos']
-    pred_map_br = info_dicts_B['bound_pred_maps']['left_br_pos']
-
-    min_y = min(chain(map(lambda d: d[1]['bbox'][0][0],
-                          info_dicts_A['right'].items()),
-                      map(lambda d: d[1]['bbox'][0][0],
-                          info_dicts_B['left'].items()),
+    min_y = min(chain(map(lambda d: d['bbox'][0][0],
+                          info_dicts_A['right'].values()),
+                      map(lambda d: d['bbox'][0][0],
+                          info_dicts_B['left'].values()),
                       [pred_map_tl[0]]))
 
-    min_x = min(chain(map(lambda d: d[1]['bbox'][0][1],
-                          info_dicts_A['right'].items()),
-                      map(lambda d: d[1]['bbox'][0][1],
-                          info_dicts_B['left'].items()),
+    min_x = min(chain(map(lambda d: d['bbox'][0][1],
+                          info_dicts_A['right'].values()),
+                      map(lambda d: d['bbox'][0][1],
+                          info_dicts_B['left'].values()),
                       [pred_map_tl[1]]))
 
-    max_y = max(chain(map(lambda d: d[1]['bbox'][1][0],
-                          info_dicts_A['right'].items()),
-                      map(lambda d: d[1]['bbox'][1][0],
-                          info_dicts_B['left'].items()),
+    max_y = max(chain(map(lambda d: d['bbox'][1][0],
+                          info_dicts_A['right'].values()),
+                      map(lambda d: d['bbox'][1][0],
+                          info_dicts_B['left'].values()),
                       [pred_map_br[0]]))
 
-    max_x = max(chain(map(lambda d: d[1]['bbox'][1][1],
-                          info_dicts_A['right'].items()),
-                      map(lambda d: d[1]['bbox'][1][1],
-                          info_dicts_B['left'].items()),
+    max_x = max(chain(map(lambda d: d['bbox'][1][1],
+                          info_dicts_A['right'].values()),
+                      map(lambda d: d['bbox'][1][1],
+                          info_dicts_B['left'].values()),
                       [pred_map_br[1]]))
 
     pad_y_A = pred_map_tl[0] - min_y
@@ -424,14 +439,22 @@ def _fix_hor_boundaries(inst_info_arr, nr_types=None):
                                                     max_x - min_x),
                                         num_tiles=(1, 1),
                                         check_sides_first=False,
-                                        ambiguous_size=0,
+                                        ambiguous_size=-1,
                                         merge_edges=False)
 
-    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
+    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
+    for k, v in bound_inst_info_arr[0, 0]['inner'].items():
+        info_dicts_A['inner'][k + '(%i,%i)' % (block_id[0], block_id[1])] = v
+        info_dicts_A['inner'][k + '(%i,%i)' % (block_id[0], block_id[1])]['merged'] = 'fix_hor_inner2inner'
+
     info_dicts_A['left'] = {}
     info_dicts_A['right'] = {}
     info_dicts_A['bound_pred_maps']['left'] = None
     info_dicts_A['bound_pred_maps']['right'] = None
+
+    # Remove the prediction maps form the inner list
+    for pred in info_dicts_A['inner'].values():
+        del pred['pred_map']
 
     inst_info_arr = np.array([[info_dicts_A]])
 
@@ -459,42 +482,72 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
       and info_dicts_B['bound_pred_maps']['top'] is not None):
         pred_map = np.vstack((info_dicts_A['bound_pred_maps']['bottom'],
                               info_dicts_B['bound_pred_maps']['top']))
+
+        pred_map_tl = info_dicts_A['bound_pred_maps']['bottom_tl_pos']
+        pred_map_br = info_dicts_B['bound_pred_maps']['top_br_pos']
+
     elif info_dicts_A['bound_pred_maps']['bottom'] is not None:
-        pred_map = np.vstack((info_dicts_A['bound_pred_maps']['bottom'],
-                              np.zeros_like(
-                                info_dicts_A['bound_pred_maps']['bottom'])))
+        pred_map = info_dicts_A['bound_pred_maps']['bottom']
+
+        pred_map_tl = info_dicts_A['bound_pred_maps']['bottom_tl_pos']
+        pred_map_br = info_dicts_A['bound_pred_maps']['bottom_br_pos']
+
     elif info_dicts_B['bound_pred_maps']['top'] is not None:
-        pred_map = np.vstack((np.zeros_like(
-                                info_dicts_B['bound_pred_maps']['top']),
-                              info_dicts_B['bound_pred_maps']['top']))
+        pred_map = info_dicts_B['bound_pred_maps']['top']
+
+        pred_map_tl = info_dicts_B['bound_pred_maps']['top_tl_pos']
+        pred_map_br = info_dicts_B['bound_pred_maps']['top_br_pos']
+
     else:
-        return inst_info_arr[:1, :]
+        # If the current chunk A is at the left or right edge of the image, 
+        # send the objects detected at the left and right boundaries to the
+        # inner detection list.
+        if block_id[1] == 0:
+            # info_dicts_A['inner'].update(info_dicts_A['left'])
+            for k, v in info_dicts_A['left'].items():
+                info_dicts_A['inner'][k] = v
+                info_dicts_A['inner'][k]['merged_A'] = 'fix_ver_left2inner'
 
-    pred_map_tl = info_dicts_A['bound_pred_maps']['bottom_tl_pos']
-    pred_map_br = info_dicts_B['bound_pred_maps']['top_br_pos']
+            info_dicts_A['left'] = {}
+            info_dicts_A['bound_pred_maps']['left'] = None
+            info_dicts_A['bound_pred_maps']['left_br_pos'] = info_dicts_A['tl_pos']
 
-    min_y = min(chain(map(lambda d: d[1]['bbox'][0][0],
-                          info_dicts_A['bottom'].items()),
-                      map(lambda d: d[1]['bbox'][0][0],
-                          info_dicts_B['top'].items()),
+        if block_id[1] == num_tiles[1] - 1:
+            # info_dicts_A['inner'].update(info_dicts_A['right'])
+            for k, v in info_dicts_A['right'].items():
+                info_dicts_A['inner'][k] = v
+                info_dicts_A['inner'][k]['merged_A'] = 'fix_ver_right2inner'
+
+            info_dicts_A['right'] = {}
+            info_dicts_A['bound_pred_maps']['right'] = None
+            info_dicts_A['bound_pred_maps']['right_tl_pos'] = info_dicts_A['br_pos']
+
+        inst_info_arr = np.array([[info_dicts_A]])
+
+        return inst_info_arr
+
+    min_y = min(chain(map(lambda d: d['bbox'][0][0],
+                          info_dicts_A['bottom'].values()),
+                      map(lambda d: d['bbox'][0][0],
+                          info_dicts_B['top'].values()),
                       [pred_map_tl[0]]))
 
-    min_x = min(chain(map(lambda d: d[1]['bbox'][0][1],
-                          info_dicts_A['bottom'].items()),
-                      map(lambda d: d[1]['bbox'][0][1],
-                          info_dicts_B['top'].items()),
+    min_x = min(chain(map(lambda d: d['bbox'][0][1],
+                          info_dicts_A['bottom'].values()),
+                      map(lambda d: d['bbox'][0][1],
+                          info_dicts_B['top'].values()),
                       [pred_map_tl[1]]))
 
-    max_y = max(chain(map(lambda d: d[1]['bbox'][1][0],
-                          info_dicts_A['bottom'].items()),
-                      map(lambda d: d[1]['bbox'][1][0],
-                          info_dicts_B['top'].items()),
+    max_y = max(chain(map(lambda d: d['bbox'][1][0],
+                          info_dicts_A['bottom'].values()),
+                      map(lambda d: d['bbox'][1][0],
+                          info_dicts_B['top'].values()),
                       [pred_map_br[0]]))
 
-    max_x = max(chain(map(lambda d: d[1]['bbox'][1][1],
-                          info_dicts_A['bottom'].items()),
-                      map(lambda d: d[1]['bbox'][1][1],
-                          info_dicts_B['top'].items()),
+    max_x = max(chain(map(lambda d: d['bbox'][1][1],
+                          info_dicts_A['bottom'].values()),
+                      map(lambda d: d['bbox'][1][1],
+                          info_dicts_B['top'].values()),
                       [pred_map_br[1]]))
 
     pad_y_A = pred_map_tl[0] - min_y
@@ -529,19 +582,46 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
                                         ambiguous_size=ambiguous_size,
                                         merge_edges=False)
 
-    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
-    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['top'])
-    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['bottom'])
+    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
+    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['top'])
+    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['bottom'])
+    for k, v in bound_inst_info_arr[0, 0]['inner'].items():
+        info_dicts_A['inner'][k] = v
+        info_dicts_A['inner'][k]['merged_B'] = 'fix_ver_inner2inner'
 
+    for k, v in bound_inst_info_arr[0, 0]['top'].items():
+        info_dicts_A['inner'][k] = v
+        info_dicts_A['inner'][k]['merged_B'] = 'fix_ver_top2inner'
+
+    for k, v in bound_inst_info_arr[0, 0]['bottom'].items():
+        info_dicts_A['inner'][k] = v
+        info_dicts_A['inner'][k]['merged_B'] = 'fix_ver_bottom2inner'
+
+    # If the current chunk A is at the left or right edge of the image, send
+    # the objects detected at the left and right boundaries to the inner
+    # detection list. Otherwise, move those to the corresponding list to be
+    # fixed on the next step.
     if block_id[1] == 0:
-        info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['left'])
+        # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['left'])
+        for k, v in bound_inst_info_arr[0, 0]['left'].items():
+            info_dicts_A['inner'][k] = v
+            info_dicts_A['inner'][k]['merged_C'] = 'fix_ver_left2inner'
     else:
-        info_dicts_A['left'].update(bound_inst_info_arr[0, 0]['left'])
+        # info_dicts_A['left'].update(bound_inst_info_arr[0, 0]['left'])
+        for k, v in bound_inst_info_arr[0, 0]['left'].items():
+            info_dicts_A['left'][k] = v
+            info_dicts_A['left'][k]['merged_C'] = 'fix_ver_left2left'
 
     if block_id[1] == num_tiles[1] - 1:
-        info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['right'])
+        # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['right'])
+        for k, v in bound_inst_info_arr[0, 0]['right'].items():
+            info_dicts_A['inner'][k] = v
+            info_dicts_A['inner'][k]['merged_C'] = 'fix_ver_right2inner'
     else:
-        info_dicts_A['right'].update(bound_inst_info_arr[0, 0]['right'])
+        # info_dicts_A['right'].update(bound_inst_info_arr[0, 0]['right'])
+        for k, v in bound_inst_info_arr[0, 0]['right'].items():
+            info_dicts_A['right'][k] = v
+            info_dicts_A['right'][k]['merged_C'] = 'fix_ver_right2right'
 
     info_dicts_A['up'] = {}
     info_dicts_A['bottom'] = {}
@@ -553,7 +633,6 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
     return inst_info_arr
 
 
-####
 class InferManagerDask(base.InferManager):
     def _save_json(self, path, info_dict, mag=None):
         json_dict = {"mag": mag, "nuc": info_dict}  # to sync the format protocol
@@ -715,10 +794,11 @@ class InferManagerDask(base.InferManager):
         )
 
         # dask.config.set(scheduler='single-threaded')
-        with ProgressBar(), CacheProfiler() as cprof, ResourceProfiler(dt=0.5) as rprof, Profiler() as prof:
+        # dicts = dict_pred_z_wsi.compute()
+        with ProgressBar(), CacheProfiler() as cprof, ResourceProfiler(dt=2) as rprof, Profiler() as prof:
             dicts = dict_pred_z_wsi.compute()
             profilers = [cprof, rprof, prof]
-            visualize(profilers, filename=os.path.join(output_dir, 'profile.html'), show=False, save=None)
+            visualize(profilers, filename=os.path.join(output_dir, 'profile.html'), show=False, save=True)
 
         self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2['inner']},
                                     list(dicts.flatten()),
@@ -726,8 +806,9 @@ class InferManagerDask(base.InferManager):
 
         all_keys = list(self.wsi_inst_info.keys())
         for i, k in enumerate(all_keys):
-            self.wsi_inst_info[i+1] = self.wsi_inst_info.pop(k)
-            del(self.wsi_inst_info[i+1]['pred_map'])
+            # self.wsi_inst_info[i+1] = self.wsi_inst_info.pop(k)
+            if 'pred_map' in self.wsi_inst_info[k]:
+                del(self.wsi_inst_info[k]['pred_map'])
 
         # ! cant possibly save the inst map at high res, too large
         start = time.perf_counter()
