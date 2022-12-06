@@ -36,7 +36,78 @@ from misc.wsi_handler import get_file_handler
 from . import base
 
 
-def _proc_np_hv(pred_inst):
+
+def _infer_patch(patch, net, block_id=None, wsi_mag=40.0, scaled_wsi_mag=1.25,
+                 num_patches=None,
+                 nr_types=None,
+                 available_gpus_ids=None):
+    scale_factor = scaled_wsi_mag / wsi_mag
+    # now rescale then return
+    if scale_factor > 1.0:
+        interp = cv2.INTER_CUBIC
+    else:
+        interp = cv2.INTER_LINEAR
+
+    # Compute the tissue mask to determine whether the tile should be passed
+    # throught the network or not.
+    wsi_thumb_rgb = cv2.resize(np.moveaxis(patch[0, :, 0], 0, -1), (0, 0),
+                                           fx=scale_factor,
+                                           fy=scale_factor,
+                                           interpolation=interp)
+
+    gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
+    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
+    mask = morphology.remove_small_objects(
+        mask == 0, min_size=16 * 16, connectivity=2
+    )
+    mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
+    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (33, 33), (16, 16))
+    mask = cv2.dilate(mask.astype(np.uint8), element)
+
+    if mask.sum() == 0:
+        pred_map = np.zeros((*patch.shape[-2:], 3 if nr_types is None else 4))
+
+    else:
+        net_idx = (block_id[0] * num_patches[1] + block_id[1]) % len(available_gpus_ids)
+
+        with torch.no_grad():
+            patch_img = torch.from_numpy(patch[:, :, 0]).contiguous()
+            # Send the patch to the corresponding GPU (id any)
+            pred_map = net[net_idx](
+                patch_img.to(
+                    'cuda:%i' % available_gpus_ids[net_idx] if torch.cuda.is_available() else 'cpu'))
+
+            pred_map = OrderedDict(
+                [[k, v.permute(0, 2, 3, 1).contiguous()]
+                 for k, v in pred_map.items()]
+            )
+
+            pred_map["np"] = F.softmax(pred_map["np"], dim=-1)[..., 1:]
+            if "tp" in pred_map:
+                type_map = F.softmax(pred_map["tp"], dim=-1)
+                type_map = torch.argmax(type_map, dim=-1, keepdim=True)
+                type_map = type_map.type(torch.float32)
+                pred_map["tp"] = type_map
+
+            pred_map = torch.cat(list(pred_map.values()), -1).cpu().numpy()
+            pred_map = pred_map[0]
+
+    return pred_map
+
+
+def _proc_np_hv(pred_map, nr_types=None):
+    if nr_types is not None:
+        pred_inst = pred_map[..., 1:]
+
+    else:
+        pred_inst = pred_map
+
+    # If the prediction map is empty/blank return a zero array
+    if pred_inst[..., 0].sum() == 0:
+        return np.zeros((*pred_map.shape[:2],
+                         5 if nr_types is not None else 4),
+                        dtype=np.float32)
+
     blb_raw = pred_inst[..., 0]
     h_dir_raw = pred_inst[..., 1]
     v_dir_raw = pred_inst[..., 2]
@@ -89,60 +160,143 @@ def _proc_np_hv(pred_inst):
 
     pred_inst = segmentation.watershed(dist, markers=marker, mask=blb)
 
+    pred_inst = np.concatenate((pred_inst[..., np.newaxis], pred_map), axis=-1)
+
     return pred_inst
 
 
-def _infer_patch(patch, net, block_id=None, wsi_mag=40.0, scaled_wsi_mag=1.25,
-                 num_patches=None,
-                 available_gpus_ids=None):
-    scale_factor = scaled_wsi_mag / wsi_mag
-    # now rescale then return
-    if scale_factor > 1.0:
-        interp = cv2.INTER_CUBIC
-    else:
-        interp = cv2.INTER_LINEAR
+def _process_instance(pred_map, inst_id, tl_pos, br_pos, merge_edges,
+                      nr_types=None,
+                      ambiguous_size=128,
+                      check_sides_first=False):
+    H, W = pred_map.shape[:2]
 
-    # Compute the tissue mask to determine whether the tile should be passed
-    # throught the network or not.
-    wsi_thumb_rgb = cv2.resize(np.moveaxis(patch[0, :, 0], 0, -1), (0, 0),
-                                           fx=scale_factor,
-                                           fy=scale_factor,
-                                           interpolation=interp)
+    inst_map_full = pred_map[..., 0] == inst_id
 
-    gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
-    mask = morphology.remove_small_objects(
-        mask == 0, min_size=16 * 16, connectivity=2
+    rmin, rmax, cmin, cmax = get_bounding_box(inst_map_full)
+
+    inst_bbox = np.array([[rmin, cmin], [rmax, cmax]])
+    inst_map = inst_map_full[inst_bbox[0][0]:inst_bbox[1][0],
+                             inst_bbox[0][1]:inst_bbox[1][1]]
+
+    inst_map = inst_map.astype(np.uint8)
+    inst_moment = cv2.moments(inst_map)
+    inst_contour = cv2.findContours(
+        inst_map, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
     )
-    mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
-    mask = morphology.binary_dilation(mask, morphology.disk(16))
 
-    if mask.sum() == 0:
-        pred_map = np.zeros((*patch.shape[-2:], 4))
+    # * opencv protocol format may break
+    inst_contour = np.squeeze(inst_contour[0][0].astype("int32"))
+
+    # < 3 points dont make a contour, so skip, likely artifact too
+    # as the contours obtained via approximation => too small or sthg
+    if inst_contour.shape[0] < 3 or len(inst_contour.shape) != 2:
+        return None, None
+
+    inst_centroid = [
+        (inst_moment["m10"] / inst_moment["m00"]),
+        (inst_moment["m01"] / inst_moment["m00"]),
+    ]
+
+    inst_centroid = np.array(inst_centroid)
+    inst_contour[:, 0] += inst_bbox[0][1] + tl_pos[1]  # X
+    inst_contour[:, 1] += inst_bbox[0][0] + tl_pos[0]  # Y
+    inst_centroid[0] += inst_bbox[0][1] + tl_pos[1]  # X
+    inst_centroid[1] += inst_bbox[0][0] + tl_pos[0]  # Y
+
+    if nr_types is not None:
+        inst_type_crop = pred_map[inst_bbox[0][0]:inst_bbox[1][0],
+                                    inst_bbox[0][1]:inst_bbox[1][1], 1]
+
+        inst_type = inst_type_crop[np.nonzero(inst_map)]
+        type_list, type_pixels = np.unique(inst_type,
+                                            return_counts=True)
+        type_list = list(zip(type_list, type_pixels))
+        type_list = sorted(type_list, key=lambda x: x[1], reverse=True)
+        inst_type = type_list[0][0]
+        if inst_type == 0:  # ! pick the 2nd most dominant if exist
+            if len(type_list) > 1:
+                inst_type = type_list[1][0]
+        type_dict = {v[0]: v[1] for v in type_list}
+        type_prob = type_dict[inst_type] / (np.sum(inst_map) + 1.0e-6)
+        inst_type = int(inst_type)
 
     else:
-        net_idx = (block_id[0] * num_patches[1] + block_id[1]) % len(available_gpus_ids)
+        type_prob = None
+        inst_type = None
 
-        with torch.no_grad():
-            patch_img = torch.from_numpy(patch[:, :, 0]).contiguous()
-            pred_map = net[net_idx](patch_img.to('cuda:%i' % available_gpus_ids[net_idx] if torch.cuda.is_available() else 'cpu'))
+    bbox_tl_x = inst_bbox[0][1]
+    bbox_tl_y = inst_bbox[0][0]
+    bbox_br_x = inst_bbox[1][1]
+    bbox_br_y = inst_bbox[1][0]
 
-            pred_map = OrderedDict(
-                [[k, v.permute(0, 2, 3, 1).contiguous()]
-                 for k, v in pred_map.items()]
-            )
+    inst_bbox[0][1] += tl_pos[1] # X
+    inst_bbox[0][0] += tl_pos[0] # Y
+    inst_bbox[1][1] += tl_pos[1] # X
+    inst_bbox[1][0] += tl_pos[0] # Y
 
-            pred_map["np"] = F.softmax(pred_map["np"], dim=-1)[..., 1:]
-            if "tp" in pred_map:
-                type_map = F.softmax(pred_map["tp"], dim=-1)
-                type_map = torch.argmax(type_map, dim=-1, keepdim=True)
-                type_map = type_map.type(torch.float32)
-                pred_map["tp"] = type_map
+    inst_key = '%i,%i,%i,%i,%i' % (*tl_pos, *br_pos, inst_id)
 
-            pred_map = torch.cat(list(pred_map.values()), -1).cpu().numpy()
-            pred_map = pred_map[0]
+    info_dict_key = 'inner'
+    inst_pred_map = None
 
-    return pred_map
+    if ambiguous_size > 0:
+        # For objects detected at boundaries, save its corresponding
+        # prediction map. This cab be used in _fix_hor_boundaries and
+        # _fix_ver_boundaries to resolve ambiguities at chunk
+        # boundaries.
+        inst_pred_map = np.copy(pred_map[bbox_tl_y:bbox_br_y,
+                                         bbox_tl_x:bbox_br_x,
+                                         1:])
+        inst_pred_map = np.concatenate((inst_pred_map,
+                                        inst_map[..., np.newaxis]),
+                                        axis=2)
+
+        # Delete the current instance from the prediction map
+        pred_map[(*np.nonzero(inst_map_full),
+                  slice(0, 3 if nr_types is None else 4, 1))] = 0
+
+        if check_sides_first:
+            if (bbox_tl_x < ambiguous_size
+                and not merge_edges["left"]):
+                info_dict_key = 'left'
+            elif (bbox_br_x >= W - ambiguous_size
+                and not merge_edges["right"]):
+                info_dict_key = 'right'
+            elif (bbox_tl_y < ambiguous_size
+                and not merge_edges["top"]):
+                info_dict_key = 'top'
+            elif (bbox_br_y >= H - ambiguous_size
+                and not merge_edges["bottom"]):
+                info_dict_key = 'bottom'
+            else:
+                inst_pred_map = None
+        else:
+            if (bbox_tl_y < ambiguous_size
+                and not merge_edges["top"]):
+                info_dict_key = 'top'
+            elif (bbox_br_y >= H - ambiguous_size
+                and not merge_edges["bottom"]):
+                info_dict_key = 'bottom'
+            elif (bbox_tl_x < ambiguous_size
+                and not merge_edges["left"]):
+                info_dict_key = 'left'
+            elif (bbox_br_x >= W - ambiguous_size
+                and not merge_edges["right"]):
+                info_dict_key = 'right'
+            else:
+                inst_pred_map = None
+
+    inst_info_dict = {
+            "bbox": inst_bbox.tolist(),
+            "centroid": inst_centroid.tolist(),
+            "contour": inst_contour.tolist(),
+            "type_prob": type_prob,
+            "type": inst_type,
+            "pred_map": inst_pred_map
+            }
+
+    return info_dict_key, {inst_key: inst_info_dict}
 
 
 def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
@@ -151,15 +305,18 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
                   check_sides_first=True,
                   ambiguous_size=128,
                   merge_edges=True):
+
     H, W = pred_map.shape[:2]
+
     tl_pos = (block_id[0] * tile_shape[0] + offset[0],
               block_id[1] * tile_shape[1] + offset[1])
     br_pos = (tl_pos[0] + H, tl_pos[1] + W)
 
-    merge_edges_top = block_id[0] == 0 and merge_edges
-    merge_edges_bottom = block_id[0] == num_tiles[0] - 1 and merge_edges
-    merge_edges_left = block_id[1] == 0 and merge_edges
-    merge_edges_right = block_id[1] == num_tiles[1] - 1 and merge_edges
+    merge_edges = dict(
+        top=block_id[0] == 0 and merge_edges,
+        bottom=block_id[0] == num_tiles[0] - 1 and merge_edges,
+        left=block_id[1] == 0 and merge_edges,
+        right=block_id[1] == num_tiles[1] - 1 and merge_edges)
 
     # Add a correction offset to the ambiguous prediction maps according to the
     # priority (sides first or not)
@@ -189,156 +346,36 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
             bottom_br_pos=(br_pos[0], br_pos[1] - corr_hor)))
 
     if pred_map[..., 0].sum() > 0:
-        if nr_types is not None:
-            pred_type = pred_map[..., 0]
-            pred_inst = pred_map[..., 1:]
-            pred_type = pred_type.astype(np.int32)
-        else:
-            pred_inst = pred_map
-
-        pred_inst = np.squeeze(pred_inst)
-        pred_inst = _proc_np_hv(pred_inst)
-
-        inst_id_list = np.unique(pred_inst)
+        inst_id_list = np.unique(pred_map[..., 0].astype(np.int32))
         for inst_id in inst_id_list:
             if inst_id == 0:
                 # Ignore background
                 continue
 
-            inst_map_full = pred_inst == inst_id
-            # TODO: chane format of bbox output
-            rmin, rmax, cmin, cmax = get_bounding_box(inst_map_full)
-            inst_bbox = np.array([[rmin, cmin], [rmax, cmax]])
-            inst_map = inst_map_full[inst_bbox[0][0]:inst_bbox[1][0],
-                                     inst_bbox[0][1]:inst_bbox[1][1]]
-            inst_map = inst_map.astype(np.uint8)
-            inst_moment = cv2.moments(inst_map)
-            inst_contour = cv2.findContours(
-                inst_map, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
-            )
-            # * opencv protocol format may break
-            inst_contour = np.squeeze(inst_contour[0][0].astype("int32"))
-            # < 3 points dont make a contour, so skip, likely artifact too
-            # as the contours obtained via approximation => too small or sthg
-            if inst_contour.shape[0] < 3:
-                continue
-            if len(inst_contour.shape) != 2:
-                continue # ! check for trickery shape
-            inst_centroid = [
-                (inst_moment["m10"] / inst_moment["m00"]),
-                (inst_moment["m01"] / inst_moment["m00"]),
-            ]
-            inst_centroid = np.array(inst_centroid)
-            inst_contour[:, 0] += inst_bbox[0][1] + tl_pos[1]  # X
-            inst_contour[:, 1] += inst_bbox[0][0] + tl_pos[0]  # Y
-            inst_centroid[0] += inst_bbox[0][1] + tl_pos[1]  # X
-            inst_centroid[1] += inst_bbox[0][0] + tl_pos[0]  # Y
-
-            if nr_types is not None:
-                inst_type_crop = pred_type[inst_bbox[0][0]:inst_bbox[1][0],
-                                           inst_bbox[0][1]:inst_bbox[1][1]]
-                inst_type = inst_type_crop[np.nonzero(inst_map)]
-                type_list, type_pixels = np.unique(inst_type,
-                                                   return_counts=True)
-                type_list = list(zip(type_list, type_pixels))
-                type_list = sorted(type_list, key=lambda x: x[1], reverse=True)
-                inst_type = type_list[0][0]
-                if inst_type == 0:  # ! pick the 2nd most dominant if exist
-                    if len(type_list) > 1:
-                        inst_type = type_list[1][0]
-                type_dict = {v[0]: v[1] for v in type_list}
-                type_prob = type_dict[inst_type] / (np.sum(inst_map) + 1.0e-6)
-                inst_type = int(inst_type)
-            else:
-                type_prob = None
-                inst_type = None
-
-            bbox_tl_x = inst_bbox[0][1]
-            bbox_tl_y = inst_bbox[0][0]
-            bbox_br_x = inst_bbox[1][1]
-            bbox_br_y = inst_bbox[1][0]
-
-            inst_bbox[0][1] += tl_pos[1] # X
-            inst_bbox[0][0] += tl_pos[0] # Y
-            inst_bbox[1][1] += tl_pos[1] # X
-            inst_bbox[1][0] += tl_pos[0] # Y
-
-            inst_info_dict = {
-                    "bbox": inst_bbox.tolist(),
-                    "centroid": inst_centroid.tolist(),
-                    "contour": inst_contour.tolist(),
-                    "type_prob": type_prob,
-                    "type": inst_type,
-                }
-
-            inst_key = '%i,%i,%i,%i,%i' % (*tl_pos, *br_pos, inst_id)
-
-            info_dict_key = 'inner'
-            inst_pred_map = None
-
-            if ambiguous_size > 0:
-                # For objects detected at boundaries, save its corresponding
-                # prediction map. This cab be used in _fix_hor_boundaries and
-                # _fix_ver_boundaries to resolve ambiguities at chunk
-                # boundaries.
-                inst_pred_map = np.copy(pred_map[bbox_tl_y:bbox_br_y,
-                                                 bbox_tl_x:bbox_br_x,
-                                                 :])
-                inst_pred_map = np.concatenate((inst_pred_map,
-                                                inst_map[..., np.newaxis]),
-                                               axis=2)
-
-                # Delete the instance from the prediction map
-                pred_map[(*np.nonzero(inst_map_full), slice(0, 4, 1))] = 0
-
-                if check_sides_first:
-                    if (bbox_tl_x < ambiguous_size
-                      and not merge_edges_left):
-                        info_dict_key = 'left'
-                    elif (bbox_br_x >= W - ambiguous_size
-                      and not merge_edges_right):
-                        info_dict_key = 'right'
-                    elif (bbox_tl_y < ambiguous_size
-                      and not merge_edges_top):
-                        info_dict_key = 'top'
-                    elif (bbox_br_y >= H - ambiguous_size
-                      and not merge_edges_bottom):
-                        info_dict_key = 'bottom'
-                    else:
-                        inst_pred_map = None
-                else:
-                    if (bbox_tl_y < ambiguous_size
-                      and not merge_edges_top):
-                        info_dict_key = 'top'
-                    elif (bbox_br_y >= H - ambiguous_size
-                      and not merge_edges_bottom):
-                        info_dict_key = 'bottom'
-                    elif (bbox_tl_x < ambiguous_size
-                      and not merge_edges_left):
-                        info_dict_key = 'left'
-                    elif (bbox_br_x >= W - ambiguous_size
-                      and not merge_edges_right):
-                        info_dict_key = 'right'
-                    else:
-                        inst_pred_map = None
-
-            info_dicts[info_dict_key][inst_key] = inst_info_dict
-            info_dicts[info_dict_key][inst_key]['pred_map'] = inst_pred_map
+            (info_dict_key,
+             info_dict_inst) = _process_instance(pred_map, inst_id, tl_pos,
+                                                 br_pos,
+                                                 merge_edges,
+                                                 nr_types,
+                                                 ambiguous_size,
+                                                 check_sides_first)
+            if info_dict_key is not None:
+                info_dicts[info_dict_key].update(info_dict_inst)
 
         # Move the remaining ambiguous prediction map for fixing chunk
         # boundaries in the next step.
-        if not merge_edges_left and ambiguous_size > 0:
+        if not merge_edges["left"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['left'] = np.copy(
-                pred_map[corr_ver:H - corr_ver, :ambiguous_size, :])
-        if not merge_edges_right and ambiguous_size > 0:
+                pred_map[corr_ver:H - corr_ver, :ambiguous_size, 1:])
+        if not merge_edges["right"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['right'] = np.copy(
-                pred_map[corr_ver:H - corr_ver, -ambiguous_size:, :])
-        if not merge_edges_top and ambiguous_size > 0:
+                pred_map[corr_ver:H - corr_ver, -ambiguous_size:, 1:])
+        if not merge_edges["top"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['top'] = np.copy(
-                pred_map[:ambiguous_size, corr_hor:W - corr_hor, :])
-        if not merge_edges_bottom and ambiguous_size > 0:
+                pred_map[:ambiguous_size, corr_hor:W - corr_hor, 1:])
+        if not merge_edges["bottom"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['bottom'] = np.copy(
-                pred_map[-ambiguous_size:, corr_hor:W - corr_hor, :])
+                pred_map[-ambiguous_size:, corr_hor:W - corr_hor, 1:])
 
     inst_info_arr = np.array([[info_dicts]])
 
@@ -422,16 +459,19 @@ def _fix_hor_boundaries(inst_info_arr, block_id=None, nr_types=None):
         inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
         pred_map[(inst_y + d['bbox'][0][0] - min_y,
                   inst_x + d['bbox'][0][1] - min_x)] = \
-                d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+                d['pred_map'][(inst_y, inst_x,
+                               slice(0, 3 if nr_types is None else 4, 1))]
 
     for k, d in info_dicts_B['left'].items():
         inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
         pred_map[(inst_y + d['bbox'][0][0] - min_y,
                   inst_x + d['bbox'][0][1] - min_x)] = \
-                d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+                d['pred_map'][(inst_y, inst_x,
+                               slice(0, 3 if nr_types is None else 4, 1))]
 
     # Run the _post_process and get the dictionary for the individual
     # instances at the chunk boundaries
+    pred_map = _proc_np_hv(pred_map, nr_types=nr_types)
     bound_inst_info_arr = _post_process(pred_map, block_id=(0, 0), 
                                         nr_types=nr_types,
                                         offset=(min_y, min_x),
@@ -442,10 +482,7 @@ def _fix_hor_boundaries(inst_info_arr, block_id=None, nr_types=None):
                                         ambiguous_size=-1,
                                         merge_edges=False)
 
-    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
-    for k, v in bound_inst_info_arr[0, 0]['inner'].items():
-        info_dicts_A['inner'][k + '(%i,%i)' % (block_id[0], block_id[1])] = v
-        info_dicts_A['inner'][k + '(%i,%i)' % (block_id[0], block_id[1])]['merged'] = 'fix_hor_inner2inner'
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
 
     info_dicts_A['left'] = {}
     info_dicts_A['right'] = {}
@@ -503,20 +540,14 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
         # send the objects detected at the left and right boundaries to the
         # inner detection list.
         if block_id[1] == 0:
-            # info_dicts_A['inner'].update(info_dicts_A['left'])
-            for k, v in info_dicts_A['left'].items():
-                info_dicts_A['inner'][k] = v
-                info_dicts_A['inner'][k]['merged_A'] = 'fix_ver_left2inner'
+            info_dicts_A['inner'].update(info_dicts_A['left'])
 
             info_dicts_A['left'] = {}
             info_dicts_A['bound_pred_maps']['left'] = None
             info_dicts_A['bound_pred_maps']['left_br_pos'] = info_dicts_A['tl_pos']
 
         if block_id[1] == num_tiles[1] - 1:
-            # info_dicts_A['inner'].update(info_dicts_A['right'])
-            for k, v in info_dicts_A['right'].items():
-                info_dicts_A['inner'][k] = v
-                info_dicts_A['inner'][k]['merged_A'] = 'fix_ver_right2inner'
+            info_dicts_A['inner'].update(info_dicts_A['right'])
 
             info_dicts_A['right'] = {}
             info_dicts_A['bound_pred_maps']['right'] = None
@@ -562,16 +593,19 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
         inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
         pred_map[(inst_y + d['bbox'][0][0] - min_y,
                     inst_x + d['bbox'][0][1] - min_x)] = \
-                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+                    d['pred_map'][(inst_y, inst_x,
+                                   slice(0, 3 if nr_types is None else 4, 1))]
 
     for k, d in info_dicts_B['top'].items():
         inst_y, inst_x = np.nonzero(d['pred_map'][..., -1].astype(bool))
         pred_map[(inst_y + d['bbox'][0][0] - min_y,
                     inst_x + d['bbox'][0][1] - min_x)] = \
-                    d['pred_map'][(inst_y, inst_x, slice(0, 4, 1))]
+                    d['pred_map'][(inst_y, inst_x,
+                                   slice(0, 3 if nr_types is None else 4, 1))]
 
     # Run the _post_process and get the dictionary for the individual
     # instances at the chunk boundaries
+    pred_map = _proc_np_hv(pred_map, nr_types=nr_types)
     bound_inst_info_arr = _post_process(pred_map, block_id=(0, 0),
                                         nr_types=nr_types,
                                         offset=(min_y, min_x),
@@ -582,46 +616,23 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
                                         ambiguous_size=ambiguous_size,
                                         merge_edges=False)
 
-    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
-    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['top'])
-    # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['bottom'])
-    for k, v in bound_inst_info_arr[0, 0]['inner'].items():
-        info_dicts_A['inner'][k] = v
-        info_dicts_A['inner'][k]['merged_B'] = 'fix_ver_inner2inner'
-
-    for k, v in bound_inst_info_arr[0, 0]['top'].items():
-        info_dicts_A['inner'][k] = v
-        info_dicts_A['inner'][k]['merged_B'] = 'fix_ver_top2inner'
-
-    for k, v in bound_inst_info_arr[0, 0]['bottom'].items():
-        info_dicts_A['inner'][k] = v
-        info_dicts_A['inner'][k]['merged_B'] = 'fix_ver_bottom2inner'
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['top'])
+    info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['bottom'])
 
     # If the current chunk A is at the left or right edge of the image, send
     # the objects detected at the left and right boundaries to the inner
     # detection list. Otherwise, move those to the corresponding list to be
     # fixed on the next step.
     if block_id[1] == 0:
-        # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['left'])
-        for k, v in bound_inst_info_arr[0, 0]['left'].items():
-            info_dicts_A['inner'][k] = v
-            info_dicts_A['inner'][k]['merged_C'] = 'fix_ver_left2inner'
+        info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['left'])
     else:
-        # info_dicts_A['left'].update(bound_inst_info_arr[0, 0]['left'])
-        for k, v in bound_inst_info_arr[0, 0]['left'].items():
-            info_dicts_A['left'][k] = v
-            info_dicts_A['left'][k]['merged_C'] = 'fix_ver_left2left'
+        info_dicts_A['left'].update(bound_inst_info_arr[0, 0]['left'])
 
     if block_id[1] == num_tiles[1] - 1:
-        # info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['right'])
-        for k, v in bound_inst_info_arr[0, 0]['right'].items():
-            info_dicts_A['inner'][k] = v
-            info_dicts_A['inner'][k]['merged_C'] = 'fix_ver_right2inner'
+        info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['right'])
     else:
-        # info_dicts_A['right'].update(bound_inst_info_arr[0, 0]['right'])
-        for k, v in bound_inst_info_arr[0, 0]['right'].items():
-            info_dicts_A['right'][k] = v
-            info_dicts_A['right'][k]['merged_C'] = 'fix_ver_right2right'
+        info_dicts_A['right'].update(bound_inst_info_arr[0, 0]['right'])
 
     info_dicts_A['up'] = {}
     info_dicts_A['bottom'] = {}
@@ -744,6 +755,7 @@ class InferManagerDask(base.InferManager):
             wsi_mag=self.wsi_handler.metadata["base_mag"],
             scaled_wsi_mag=1.25,
             num_patches=num_patches,
+            nr_types=self.nr_types,
             available_gpus_ids=self.available_gpus_ids,
             depth=(0, 0, 0, offset, offset),
             boundary=0,
@@ -756,7 +768,15 @@ class InferManagerDask(base.InferManager):
 
         pred_z_wsi = pred_z_wsi.rechunk((tile_shape[0], tile_shape[1], 4))
 
-        post_z_wsi = pred_z_wsi.map_blocks(
+        post_np_z_wsi = pred_z_wsi.map_blocks(
+            _proc_np_hv,
+            nr_types=self.nr_types,
+            dtype=np.float32,
+            chunks=(*tile_shape, 3 if self.nr_types is None else 4),
+            meta=np.empty((0), dtype=np.float32)
+        )
+
+        post_z_wsi = post_np_z_wsi.map_blocks(
             _post_process,
             nr_types=self.nr_types,
             offset=(0, 0),
@@ -793,12 +813,14 @@ class InferManagerDask(base.InferManager):
             meta=np.empty((0), dtype=np.object)
         )
 
-        # dask.config.set(scheduler='single-threaded')
-        # dicts = dict_pred_z_wsi.compute()
-        with ProgressBar(), CacheProfiler() as cprof, ResourceProfiler(dt=2) as rprof, Profiler() as prof:
+        dask.config.set(scheduler='single-threaded')
+        with CacheProfiler() as cprof, ResourceProfiler(dt=0.1) as rprof, Profiler() as prof:
             dicts = dict_pred_z_wsi.compute()
-            profilers = [cprof, rprof, prof]
-            visualize(profilers, filename=os.path.join(output_dir, 'profile.html'), show=False, save=True)
+        # with ProgressBar(), CacheProfiler() as cprof, ResourceProfiler(dt=2) as rprof, Profiler() as prof:
+        #     dicts = dict_pred_z_wsi.compute()
+
+        profilers = [cprof, rprof, prof]    
+        visualize(profilers, filename=os.path.join(output_dir, 'profile.html'), show=False, save=True)
 
         self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2['inner']},
                                     list(dicts.flatten()),
