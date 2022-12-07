@@ -219,6 +219,8 @@ def get_patch(z, roi, shape, tl_y, tl_x, patch_size, padding, stride,
     ----------
     z : dask.array.core.Array, numpy.array or zarr.array
         A full array from where to take a patch
+    roi : iterable of slices
+        The active ROI that is used from the array `z`
     shape : tuple of ints
         Shape of the original array. For compressed representation of images,
         the shape of the uncompressed image.
