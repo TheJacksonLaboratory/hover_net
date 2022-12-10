@@ -223,7 +223,7 @@ class ZarrHandler(FileHandler):
         pyr_res = [tuple(self.file_ptr[self._data_group + '/' + res_path].shape[-2:])
                    for res_path in sorted(self.file_ptr[self._data_group]) if res_path != '0']
 
-        magnification_level = [nom_mag] + [nom_mag / (base_shape[0] / res[0])
+        magnification_level = [nom_mag] + [nom_mag / (base_shape[1] / res[0])
                                            for res in pyr_res]
 
         mpp = np.array([

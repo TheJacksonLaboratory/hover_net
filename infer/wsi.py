@@ -36,35 +36,17 @@ from misc.wsi_handler import get_file_handler
 from . import base
 
 
-
-def _infer_patch(patch, net, block_id=None, wsi_mag=40.0, scaled_wsi_mag=1.25,
+def _infer_patch(patch, net, mask, block_id=None, scaled_patch_shape=None,
                  num_patches=None,
                  nr_types=None,
                  available_gpus_ids=None):
-    scale_factor = scaled_wsi_mag / wsi_mag
-    # now rescale then return
-    if scale_factor > 1.0:
-        interp = cv2.INTER_CUBIC
-    else:
-        interp = cv2.INTER_LINEAR
 
-    # Compute the tissue mask to determine whether the tile should be passed
-    # throught the network or not.
-    wsi_thumb_rgb = cv2.resize(np.moveaxis(patch[0, :, 0], 0, -1), (0, 0),
-                                           fx=scale_factor,
-                                           fy=scale_factor,
-                                           interpolation=interp)
+    roi = tuple([slice(sp * b, sp * (b + 1), 1)
+                 for sp, b in zip(scaled_patch_shape, block_id)])
 
-    gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
-    mask = morphology.remove_small_objects(
-        mask == 0, min_size=16 * 16, connectivity=2
-    )
-    mask = morphology.remove_small_holes(mask, area_threshold=128 * 128)
-    element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (33, 33), (16, 16))
-    mask = cv2.dilate(mask.astype(np.uint8), element)
+    roi_mask = mask[roi]
 
-    if mask.sum() == 0:
+    if roi_mask.sum() == 0:
         pred_map = np.zeros((*patch.shape[-2:], 3 if nr_types is None else 4))
 
     else:
@@ -672,6 +654,7 @@ class InferManagerDask(base.InferManager):
 
         """
         # TODO: customize universal file handler to sync the protocol
+        scaled_wsi_mag = 1.25  # ! hard coded
         ambiguous_size = self.ambiguous_size
         tile_shape = (np.array(self.tile_shape)).astype(np.int64)
         patch_output_shape = np.array(self.patch_output_shape)
@@ -696,7 +679,6 @@ class InferManagerDask(base.InferManager):
 
             # simple method to extract tissue regions using intensity thresholding and morphological operations
             def simple_get_mask():
-                scaled_wsi_mag = 1.25  # ! hard coded
                 wsi_thumb_rgb = self.wsi_handler.get_full_img(read_mag=scaled_wsi_mag)
                 gray = cv2.cvtColor(wsi_thumb_rgb, cv2.COLOR_RGB2GRAY)
                 _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_OTSU)
@@ -723,6 +705,9 @@ class InferManagerDask(base.InferManager):
         # If the mask is blank at that position, return a zero array instead of
         # the network inference.
         offset = (self.patch_input_shape[0] - self.patch_output_shape[0]) // 2
+
+        # dask.config.set(scheduler='single-threaded')
+
         z_wsi = da.from_zarr(self.wsi_handler._file_path,
                              component=self.method['data_group'] + '/0')
 
@@ -738,6 +723,9 @@ class InferManagerDask(base.InferManager):
                                               patch_output_shape,
                                               num_patches)]
 
+        scaled_patch_shape = [int(math.ceil(p * scaled_wsi_mag / self.wsi_handler.metadata["base_mag"]))
+                              for p in self.patch_output_shape]
+
         paddings = [(0, 0), (0, 0), (0, 0)]
         paddings += [(0, n_p * p - s)
                      for s, p, n_p in zip(self.wsi_proc_shape,
@@ -751,9 +739,9 @@ class InferManagerDask(base.InferManager):
 
         pred_z_wsi = padded_z_wsi.map_overlap(
             _infer_patch,
+            mask=self.wsi_mask,
             net=self.run_step,
-            wsi_mag=self.wsi_handler.metadata["base_mag"],
-            scaled_wsi_mag=1.25,
+            scaled_patch_shape=scaled_patch_shape,
             num_patches=num_patches,
             nr_types=self.nr_types,
             available_gpus_ids=self.available_gpus_ids,
@@ -813,14 +801,11 @@ class InferManagerDask(base.InferManager):
             meta=np.empty((0), dtype=np.object)
         )
 
-        dask.config.set(scheduler='single-threaded')
-        with CacheProfiler() as cprof, ResourceProfiler(dt=0.1) as rprof, Profiler() as prof:
+        with ProgressBar(): #, CacheProfiler() as cprof, ResourceProfiler(dt=2) as rprof, Profiler() as prof:
             dicts = dict_pred_z_wsi.compute()
-        # with ProgressBar(), CacheProfiler() as cprof, ResourceProfiler(dt=2) as rprof, Profiler() as prof:
-        #     dicts = dict_pred_z_wsi.compute()
 
-        profilers = [cprof, rprof, prof]    
-        visualize(profilers, filename=os.path.join(output_dir, 'profile.html'), show=False, save=True)
+        # profilers = [cprof, rprof, prof]
+        # visualize(profilers, filename=os.path.join(output_dir, 'profile_hor.html'), show=False, save=True)
 
         self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2['inner']},
                                     list(dicts.flatten()),
