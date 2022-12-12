@@ -3,7 +3,7 @@ import sys
 import zarr
 import json
 import numpy as np
-import matplotlib.pyplot as plt
+from PIL import Image
 
 from skimage import draw
 
@@ -54,80 +54,59 @@ if __name__ == "__main__":
     log_dir = sys.argv[1]
     img_dir = sys.argv[2]
     img = sys.argv[3]
+    patch_size = int(sys.argv[4])
+    ambiguous_size = int(sys.argv[5])
+
     pred_src = json.load(open("%s/%s_zarr.json" % (log_dir, img), "r"))
     pred_ref = json.load(open("%s/%s.json" % (log_dir, img), "r"))
 
     z = np.moveaxis(zarr.open("%s/%s.zarr" % (img_dir, img), "r")['0/0'][0, :, 0], 0, -1)
 
-    patches_src = plotpred(pred_src, (z.shape[0], z.shape[1]), color=(127, 127, 127), dst_img=z//2)
-    patches_ref = plotpred(pred_ref, (z.shape[0], z.shape[1]), color=(127, 0, 0), dst_img=z//2)
+    patches_src = plotpred(pred_src, (z.shape[0], z.shape[1]), color=(0, 127, 0), dst_img=z//2)
+    patches_ref = plotpred(pred_ref, (z.shape[0], z.shape[1]), color=(0, 127, 0), dst_img=z//2)
 
-    n_chunks_h = int(math.ceil(z.shape[0] / 328))
-    n_chunks_w = int(math.ceil(z.shape[1] / 328))
+    n_chunks_h = z.shape[0] // patch_size
+    n_chunks_w = z.shape[1] // patch_size
 
-    plt.imshow(patches_src - patches_ref)
-    plt.show()
+    diff = patches_src - patches_ref
 
-    fig, (ax1, ax2) = plt.subplots(1, 2)
-    ax1.set_title('Reference')
-    ax1.imshow(patches_src)
-    ax2.set_title('Dask')
-    ax2.imshow(patches_ref)
+    diff = Image.fromarray(diff)
+    diff.save('%s/patches_diff.jpeg' % log_dir)
 
-    for i in range(1, n_chunks_h):
-        ax2.plot([0, z.shape[1]], [328 * i, 328 * i], 'b-')
-        ax2.plot([0, z.shape[1]], [328 * i + 64, 328 * i + 64], 'c:')
-        ax2.plot([0, z.shape[1]], [328 * i - 64, 328 * i - 64], 'c:')
+    im_ref = Image.fromarray(patches_ref)
+    im_ref.save('%s/patches_ref_overlay.jpeg' % log_dir)
 
-    for i in range(1, n_chunks_w):
-        ax2.plot([328 * i, 328 * i], [0, z.shape[0]], 'b-')
-        ax2.plot([328 * i + 64, 328 * i + 64], [0, z.shape[0]], 'c:')
-        ax2.plot([328 * i - 64, 328 * i - 64], [0, z.shape[0]], 'c:')
+    im_src = Image.fromarray(patches_src)
+    im_src.save('%s/patches_src_overlay.jpeg' % log_dir)
 
-    plt.savefig("%s/patches_comp_overlay.png" % log_dir)
-    plt.show()
-
-    patches_src = plotpred(pred_src, (z.shape[0], z.shape[1]), color=(127, 127, 127))
-    patches_ref = plotpred(pred_ref, (z.shape[0], z.shape[1]), color=(127, 0, 0))
-
-    plt.imshow(patches_src - patches_ref)
+    patches_src = plotpred(pred_src, (z.shape[0], z.shape[1]), color=(0, 127, 0))
+    patches_ref = plotpred(pred_ref, (z.shape[0], z.shape[1]), color=(0, 0, 127))
 
     for i in range(1, n_chunks_h):
-        plt.plot([0, z.shape[1]], [328 * i, 328 * i], 'b-')
-        plt.plot([0, z.shape[1]], [328 * i + 64, 328 * i + 64], 'c:')
-        plt.plot([0, z.shape[1]], [328 * i - 64, 328 * i - 64], 'c:')
+        patches_ref[patch_size * i, :, 0] = 127
+        patches_ref[patch_size * i + ambiguous_size, :, 0] = 127
+        patches_ref[patch_size * i + ambiguous_size, :, 1] = 127
+        patches_ref[patch_size * i - ambiguous_size, :, 0] = 127
+        patches_ref[patch_size * i - ambiguous_size, :, 1] = 127
 
     for i in range(1, n_chunks_w):
-        plt.plot([328 * i, 328 * i], [0, z.shape[0]], 'b-')
-        plt.plot([328 * i + 64, 328 * i + 64], [0, z.shape[0]], 'c:')
-        plt.plot([328 * i - 64, 328 * i - 64], [0, z.shape[0]], 'c:')
+        patches_ref[:, patch_size * i, 0] = 127
+        patches_ref[:, patch_size * i + ambiguous_size, 0] = 127
+        patches_ref[:, patch_size * i + ambiguous_size, 1] = 127
+        patches_ref[:, patch_size * i - ambiguous_size, 0] = 127
+        patches_ref[:, patch_size * i - ambiguous_size, 1] = 127
 
-    plt.savefig("%s/patches_diff.png" % log_dir)
-    plt.show()
+    im_ref = Image.fromarray(patches_ref)
+    im_ref.save('%s/patches_ref.jpeg' % log_dir)
 
-    plt.subplot(1, 2, 1)
-    plt.imshow(patches_src)
-    plt.subplot(1, 2, 2)
-    plt.imshow(patches_ref)
+    im_src = Image.fromarray(patches_src)
+    im_src.save('%s/patches_src.jpeg' % log_dir)
 
-    for i in range(1, n_chunks_h):
-        plt.plot([0, z.shape[1]], [328 * i, 328 * i], 'b-')
-        plt.plot([0, z.shape[1]], [328 * i + 64, 328 * i + 64], 'c:')
-        plt.plot([0, z.shape[1]], [328 * i - 64, 328 * i - 64], 'c:')
+    # overlapped_preds_src = checkpred(pred_src['nuc'], (z.shape[0], z.shape[1]))
+    # print('Overlapped predictions zarr-based', len(overlapped_preds_src))
 
-    for i in range(1, n_chunks_w):
-        plt.plot([328 * i, 328 * i], [0, z.shape[0]], 'b-')
-        plt.plot([328 * i + 64, 328 * i + 64], [0, z.shape[0]], 'c:')
-        plt.plot([328 * i - 64, 328 * i - 64], [0, z.shape[0]], 'c:')
+    # overlapped_preds_ref = checkpred(pred_ref['nuc'], (z.shape[0], z.shape[1]))
+    # print('Overlapped predictions dask-based', len(overlapped_preds_ref))
 
-    plt.savefig("%s/patches_comp.png" % log_dir)
-    plt.show()
-
-    overlapped_preds_src = checkpred(pred_src['nuc'], (z.shape[0], z.shape[1]))
-    print('Overlapped predictions zarr-based', len(overlapped_preds_src))
-
-    overlapped_preds_ref = checkpred(pred_ref['nuc'], (z.shape[0], z.shape[1]))
-    print('Overlapped predictions dask-based', len(overlapped_preds_ref))
-
-    for ovp in overlapped_preds_ref:
-        print(ovp)
+    # for ovp in overlapped_preds_ref:
+    #    print(ovp)

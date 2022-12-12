@@ -1,0 +1,49 @@
+version: '3.4'
+
+services:
+  infer:
+    image: hovernet
+    volumes:
+      - type: bind
+        source: /mnt/c/Users/cervaf/Documents/Logging/hover_net
+        target: /mnt/log
+      - type: bind
+        source: /mnt/c/Users/cervaf/Documents/Apps/hover_net
+        target: /mnt/src
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    command: ["sh", "-c", "python -m debugpy --wait-for-client --listen 0.0.0.0:5678 /mnt/src/run_infer.py
+            --nr_types 5 --type_info_path /mnt/src/type_info.json
+            --batch_size 5 --model_mode fast
+            --model_path  /mnt/log/pretrained_models/hovernet_fast_monusac_type_tf2pytorch.tar
+            --nr_inference_workers 0 --nr_post_proc_workers 0
+            --patch_input_size 184
+            wsi
+            --input_dir /mnt/log/zarr
+            --output_dir /mnt/log/result
+            --input_mask_dir  /mnt/log/mask
+            --cache_path /mnt/log/result/cache
+            --tile_shape 92
+            --ambiguous_size 8
+            --proc_mag 40
+            --keep_maps"]
+    ports:
+      - 5678:5678
+
+  eval:
+    image: hovernet
+    volumes:
+      - type: bind
+        source: /mnt/c/Users/cervaf/Documents/Logging/hover_net
+        target: /mnt/log
+      - type: bind
+        source: /mnt/c/Users/cervaf/Documents/Apps/hover_net
+        target: /mnt/src
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    command: ["sh", "-c", "python -m debugpy --wait-for-client --listen 0.0.0.0:5678 /mnt/src/examples/plotpred.py
+            /mnt/log/result /mnt/log/zarr TCGA-50-6591-01Z-00-DX1_001 92 8"]
+    ports:
+      - 5678:5678

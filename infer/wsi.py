@@ -36,124 +36,55 @@ from misc.wsi_handler import get_file_handler
 from . import base
 
 
-def _infer_patch(patch, net, mask, block_id=None, scaled_patch_shape=None,
+def _infer_patch(patch, net, mask=None, scaled_patch_shape=None,
+                 block_id=None,
+                 offset=0,
                  num_patches=None,
                  nr_types=None,
                  available_gpus_ids=None):
 
-    roi = tuple([slice(sp * b, sp * (b + 1), 1)
-                 for sp, b in zip(scaled_patch_shape, block_id)])
+    if mask is not None:
+        roi = tuple([slice(sp * b, sp * (b + 1), 1)
+                     for sp, b in zip(scaled_patch_shape, block_id)])
 
-    roi_mask = mask[roi]
+        if np.sum(mask[roi]) == 0:
+            H, W = patch.shape[-2:]
+            h = H - offset
+            w = W - offset
+            return np.zeros((h, w, 3 if nr_types is None else 4))
 
-    if roi_mask.sum() == 0:
-        pred_map = np.zeros((*patch.shape[-2:], 3 if nr_types is None else 4))
+    net_idx = (block_id[0] * num_patches[1] + block_id[1]) % len(available_gpus_ids)
+    with torch.no_grad():
+        patch_img = torch.from_numpy(patch[:, :, 0]).contiguous()
+        # Send the patch to the corresponding GPU (id any)
+        pred_map = net[net_idx](
+            patch_img.to(
+                'cuda:%i' % available_gpus_ids[net_idx] if torch.cuda.is_available() else 'cpu'))
 
-    else:
-        net_idx = (block_id[0] * num_patches[1] + block_id[1]) % len(available_gpus_ids)
+        pred_map = OrderedDict(
+            [[k, v.permute(0, 2, 3, 1).contiguous()]
+             for k, v in pred_map.items()]
+        )
+        pred_map["np"] = F.softmax(pred_map["np"], dim=-1)[..., 1:]
+        if "tp" in pred_map:
+            type_map = F.softmax(pred_map["tp"], dim=-1)
+            type_map = torch.argmax(type_map, dim=-1, keepdim=True)
+            type_map = type_map.type(torch.float32)
+            pred_map["tp"] = type_map
 
-        with torch.no_grad():
-            patch_img = torch.from_numpy(patch[:, :, 0]).contiguous()
-            # Send the patch to the corresponding GPU (id any)
-            pred_map = net[net_idx](
-                patch_img.to(
-                    'cuda:%i' % available_gpus_ids[net_idx] if torch.cuda.is_available() else 'cpu'))
-
-            pred_map = OrderedDict(
-                [[k, v.permute(0, 2, 3, 1).contiguous()]
-                 for k, v in pred_map.items()]
-            )
-
-            pred_map["np"] = F.softmax(pred_map["np"], dim=-1)[..., 1:]
-            if "tp" in pred_map:
-                type_map = F.softmax(pred_map["tp"], dim=-1)
-                type_map = torch.argmax(type_map, dim=-1, keepdim=True)
-                type_map = type_map.type(torch.float32)
-                pred_map["tp"] = type_map
-
-            pred_map = torch.cat(list(pred_map.values()), -1).cpu().numpy()
-            pred_map = pred_map[0]
+        pred_map = torch.cat(list(pred_map.values()), -1).cpu().numpy()
+        pred_map = pred_map[0]
 
     return pred_map
 
 
-def _proc_np_hv(pred_map, nr_types=None):
-    if nr_types is not None:
-        pred_inst = pred_map[..., 1:]
-
-    else:
-        pred_inst = pred_map
-
-    # If the prediction map is empty/blank return a zero array
-    if pred_inst[..., 0].sum() == 0:
-        return np.zeros((*pred_map.shape[:2],
-                         5 if nr_types is not None else 4),
-                        dtype=np.float32)
-
-    blb_raw = pred_inst[..., 0]
-    h_dir_raw = pred_inst[..., 1]
-    v_dir_raw = pred_inst[..., 2]
-
-    # processing
-    blb = np.array(blb_raw >= 0.5, dtype=np.uint8)
-
-    blb = cv2.connectedComponents(blb)[1]
-    blb = morphology.remove_small_objects(blb, min_size=10)
-    blb[blb > 0] = 1  # background is 0 already
-
-    h_dir = cv2.normalize(
-        h_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
-    )
-    v_dir = cv2.normalize(
-        v_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
-    )
-
-    sobelh = cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21)
-    sobelv = cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21)
-
-    sobelh = 1 - (
-        cv2.normalize(
-            sobelh, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
-        )
-    )
-    sobelv = 1 - (
-        cv2.normalize(
-            sobelv, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
-        )
-    )
-
-    overall = np.maximum(sobelh, sobelv)
-    overall = overall - (1 - blb)
-    overall[overall < 0] = 0
-
-    dist = (1.0 - overall) * blb
-    ## nuclei values form mountains so inverse to get basins
-    dist = -cv2.GaussianBlur(dist, (3, 3), 0)
-
-    overall = np.array(overall >= 0.4, dtype=np.int32)
-
-    marker = blb - overall
-    marker[marker < 0] = 0
-    marker = binary_fill_holes(marker).astype("uint8")
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
-    marker = cv2.connectedComponents(marker)[1]
-    marker = morphology.remove_small_objects(marker, min_size=10)
-
-    pred_inst = segmentation.watershed(dist, markers=marker, mask=blb)
-
-    pred_inst = np.concatenate((pred_inst[..., np.newaxis], pred_map), axis=-1)
-
-    return pred_inst
-
-
-def _process_instance(pred_map, inst_id, tl_pos, br_pos, merge_edges,
+def _process_instance(pred_map, pred_inst, inst_id, tl_pos, br_pos, merge_edges,
                       nr_types=None,
                       ambiguous_size=128,
                       check_sides_first=False):
-    H, W = pred_map.shape[:2]
+    H, W = pred_inst.shape
 
-    inst_map_full = pred_map[..., 0] == inst_id
+    inst_map_full = pred_inst == inst_id
 
     rmin, rmax, cmin, cmax = get_bounding_box(inst_map_full)
 
@@ -188,17 +119,20 @@ def _process_instance(pred_map, inst_id, tl_pos, br_pos, merge_edges,
 
     if nr_types is not None:
         inst_type_crop = pred_map[inst_bbox[0][0]:inst_bbox[1][0],
-                                    inst_bbox[0][1]:inst_bbox[1][1], 1]
+                                  inst_bbox[0][1]:inst_bbox[1][1], 0]
 
         inst_type = inst_type_crop[np.nonzero(inst_map)]
         type_list, type_pixels = np.unique(inst_type,
-                                            return_counts=True)
+                                           return_counts=True)
+
         type_list = list(zip(type_list, type_pixels))
         type_list = sorted(type_list, key=lambda x: x[1], reverse=True)
         inst_type = type_list[0][0]
+
         if inst_type == 0:  # ! pick the 2nd most dominant if exist
             if len(type_list) > 1:
                 inst_type = type_list[1][0]
+
         type_dict = {v[0]: v[1] for v in type_list}
         type_prob = type_dict[inst_type] / (np.sum(inst_map) + 1.0e-6)
         inst_type = int(inst_type)
@@ -228,15 +162,10 @@ def _process_instance(pred_map, inst_id, tl_pos, br_pos, merge_edges,
         # _fix_ver_boundaries to resolve ambiguities at chunk
         # boundaries.
         inst_pred_map = np.copy(pred_map[bbox_tl_y:bbox_br_y,
-                                         bbox_tl_x:bbox_br_x,
-                                         1:])
+                                         bbox_tl_x:bbox_br_x])
         inst_pred_map = np.concatenate((inst_pred_map,
                                         inst_map[..., np.newaxis]),
                                         axis=2)
-
-        # Delete the current instance from the prediction map
-        pred_map[(*np.nonzero(inst_map_full),
-                  slice(0, 3 if nr_types is None else 4, 1))] = 0
 
         if check_sides_first:
             if (bbox_tl_x < ambiguous_size
@@ -281,7 +210,8 @@ def _process_instance(pred_map, inst_id, tl_pos, br_pos, merge_edges,
     return info_dict_key, {inst_key: inst_info_dict}
 
 
-def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
+def _post_process(pred_map, mask=None, scaled_patch_shape=None,
+                  block_id=None, nr_types=None, offset=None,
                   tile_shape=None,
                   num_tiles=None,
                   check_sides_first=True,
@@ -327,37 +257,108 @@ def _post_process(pred_map, block_id=None, nr_types=None, offset=None,
             bottom_tl_pos=(br_pos[0] - ambiguous_size, tl_pos[1] + corr_hor),
             bottom_br_pos=(br_pos[0], br_pos[1] - corr_hor)))
 
-    if pred_map[..., 0].sum() > 0:
-        inst_id_list = np.unique(pred_map[..., 0].astype(np.int32))
-        for inst_id in inst_id_list:
-            if inst_id == 0:
-                # Ignore background
-                continue
+    if mask is not None:
+        roi = tuple([slice(sp * b, sp * (b + 1), 1)
+                     for sp, b in zip(scaled_patch_shape, block_id)])
+        if np.sum(mask[roi]) == 0:
+            return np.array([[info_dicts]])
 
-            (info_dict_key,
-             info_dict_inst) = _process_instance(pred_map, inst_id, tl_pos,
-                                                 br_pos,
-                                                 merge_edges,
-                                                 nr_types,
-                                                 ambiguous_size,
-                                                 check_sides_first)
-            if info_dict_key is not None:
-                info_dicts[info_dict_key].update(info_dict_inst)
+    if nr_types is not None:
+        pred_inst = pred_map[..., 1:]
 
-        # Move the remaining ambiguous prediction map for fixing chunk
-        # boundaries in the next step.
-        if not merge_edges["left"] and ambiguous_size > 0:
+    else:
+        pred_inst = pred_map
+
+    # If the prediction map is empty/blank return a zero array
+    blb_raw = pred_inst[..., 0]
+    h_dir_raw = pred_inst[..., 1]
+    v_dir_raw = pred_inst[..., 2]
+
+    # processing
+    blb = np.array(blb_raw >= 0.5, dtype=np.uint8)
+
+    num_cc, blb = cv2.connectedComponents(blb)
+    if num_cc > 1:
+        blb = morphology.remove_small_objects(blb, min_size=10)
+
+    blb[blb > 0] = 1  # background is 0 already
+
+    h_dir = cv2.normalize(
+        h_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+    v_dir = cv2.normalize(
+        v_dir_raw, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+    )
+
+    sobelh = cv2.Sobel(h_dir, cv2.CV_64F, 1, 0, ksize=21)
+    sobelv = cv2.Sobel(v_dir, cv2.CV_64F, 0, 1, ksize=21)
+
+    sobelh = 1 - (
+        cv2.normalize(
+            sobelh, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+    sobelv = 1 - (
+        cv2.normalize(
+            sobelv, None, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX, dtype=cv2.CV_32F
+        )
+    )
+
+    overall = np.maximum(sobelh, sobelv)
+    overall = overall - (1 - blb)
+    overall[overall < 0] = 0
+
+    dist = (1.0 - overall) * blb
+    ## nuclei values form mountains so inverse to get basins
+    dist = -cv2.GaussianBlur(dist, (3, 3), 0)
+
+    overall = np.array(overall >= 0.4, dtype=np.int32)
+
+    marker = blb - overall
+    marker[marker < 0] = 0
+    marker = binary_fill_holes(marker).astype("uint8")
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    marker = cv2.morphologyEx(marker, cv2.MORPH_OPEN, kernel)
+    num_cc, marker = cv2.connectedComponents(marker)
+    if num_cc > 1:
+        marker = morphology.remove_small_objects(marker, min_size=10)
+
+    pred_inst = segmentation.watershed(dist, markers=marker, mask=blb)
+    pred_inst = pred_inst.astype(np.int32)
+
+    inst_id_list = np.unique(pred_inst)[1:]
+    for inst_id in inst_id_list:
+        (info_dict_key,
+         info_dict_inst) = _process_instance(pred_map, pred_inst, inst_id,
+                                             tl_pos,
+                                             br_pos,
+                                             merge_edges,
+                                             nr_types,
+                                             ambiguous_size,
+                                             check_sides_first)
+
+        if info_dict_key is not None:
+            info_dicts[info_dict_key].update(info_dict_inst)
+
+    # Delete the current instance from the prediction map
+    pred_map[(*np.nonzero(pred_inst),
+             slice(0, 2 if nr_types is None else 3, 1))] = 0
+
+    # Move the remaining ambiguous prediction map for fixing chunk
+    # boundaries in the next step.
+    if ambiguous_size > 0 and merge_edges:
+        if not merge_edges["left"]:
             info_dicts['bound_pred_maps']['left'] = np.copy(
-                pred_map[corr_ver:H - corr_ver, :ambiguous_size, 1:])
+                pred_map[corr_ver:H - corr_ver, :ambiguous_size])
         if not merge_edges["right"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['right'] = np.copy(
-                pred_map[corr_ver:H - corr_ver, -ambiguous_size:, 1:])
+                pred_map[corr_ver:H - corr_ver, -ambiguous_size:])
         if not merge_edges["top"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['top'] = np.copy(
-                pred_map[:ambiguous_size, corr_hor:W - corr_hor, 1:])
+                pred_map[:ambiguous_size, corr_hor:W - corr_hor])
         if not merge_edges["bottom"] and ambiguous_size > 0:
             info_dicts['bound_pred_maps']['bottom'] = np.copy(
-                pred_map[-ambiguous_size:, corr_hor:W - corr_hor, 1:])
+                pred_map[-ambiguous_size:, corr_hor:W - corr_hor])
 
     inst_info_arr = np.array([[info_dicts]])
 
@@ -389,13 +390,13 @@ def _fix_hor_boundaries(inst_info_arr, block_id=None, nr_types=None):
         pred_map_br = info_dicts_B['bound_pred_maps']['left_br_pos']
 
     elif info_dicts_A['bound_pred_maps']['right'] is not None:
-        pred_map = info_dicts_A['bound_pred_maps']['right']
+        pred_map = np.copy(info_dicts_A['bound_pred_maps']['right'])
 
         pred_map_tl = info_dicts_A['bound_pred_maps']['right_tl_pos']
         pred_map_br = info_dicts_A['bound_pred_maps']['right_br_pos']
 
     elif info_dicts_B['bound_pred_maps']['left'] is not None:
-        pred_map = info_dicts_B['bound_pred_maps']['left']
+        pred_map = np.copy(info_dicts_B['bound_pred_maps']['left'])
 
         pred_map_tl = info_dicts_B['bound_pred_maps']['left_tl_pos']
         pred_map_br = info_dicts_B['bound_pred_maps']['left_br_pos']
@@ -453,7 +454,6 @@ def _fix_hor_boundaries(inst_info_arr, block_id=None, nr_types=None):
 
     # Run the _post_process and get the dictionary for the individual
     # instances at the chunk boundaries
-    pred_map = _proc_np_hv(pred_map, nr_types=nr_types)
     bound_inst_info_arr = _post_process(pred_map, block_id=(0, 0), 
                                         nr_types=nr_types,
                                         offset=(min_y, min_x),
@@ -466,9 +466,7 @@ def _fix_hor_boundaries(inst_info_arr, block_id=None, nr_types=None):
 
     info_dicts_A['inner'].update(bound_inst_info_arr[0, 0]['inner'])
 
-    info_dicts_A['left'] = {}
     info_dicts_A['right'] = {}
-    info_dicts_A['bound_pred_maps']['left'] = None
     info_dicts_A['bound_pred_maps']['right'] = None
 
     # Remove the prediction maps form the inner list
@@ -506,13 +504,13 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
         pred_map_br = info_dicts_B['bound_pred_maps']['top_br_pos']
 
     elif info_dicts_A['bound_pred_maps']['bottom'] is not None:
-        pred_map = info_dicts_A['bound_pred_maps']['bottom']
+        pred_map = np.copy(info_dicts_A['bound_pred_maps']['bottom'])
 
         pred_map_tl = info_dicts_A['bound_pred_maps']['bottom_tl_pos']
         pred_map_br = info_dicts_A['bound_pred_maps']['bottom_br_pos']
 
     elif info_dicts_B['bound_pred_maps']['top'] is not None:
-        pred_map = info_dicts_B['bound_pred_maps']['top']
+        pred_map = np.copy(info_dicts_B['bound_pred_maps']['top'])
 
         pred_map_tl = info_dicts_B['bound_pred_maps']['top_tl_pos']
         pred_map_br = info_dicts_B['bound_pred_maps']['top_br_pos']
@@ -587,7 +585,6 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
 
     # Run the _post_process and get the dictionary for the individual
     # instances at the chunk boundaries
-    pred_map = _proc_np_hv(pred_map, nr_types=nr_types)
     bound_inst_info_arr = _post_process(pred_map, block_id=(0, 0),
                                         nr_types=nr_types,
                                         offset=(min_y, min_x),
@@ -616,9 +613,7 @@ def _fix_ver_boundaries(inst_info_arr, block_id=None, nr_types=None,
     else:
         info_dicts_A['right'].update(bound_inst_info_arr[0, 0]['right'])
 
-    info_dicts_A['up'] = {}
     info_dicts_A['bottom'] = {}
-    info_dicts_A['bound_pred_maps']['up'] = None
     info_dicts_A['bound_pred_maps']['bottom'] = None
 
     inst_info_arr = np.array([[info_dicts_A]])
@@ -663,7 +658,6 @@ class InferManagerDask(base.InferManager):
         wsi_ext = path_obj.suffix
         wsi_name = path_obj.stem
 
-        start = time.perf_counter()
         self.wsi_handler = get_file_handler(wsi_path, backend=wsi_ext,
                                             data_group=self.method['data_group'])
 
@@ -672,7 +666,7 @@ class InferManagerDask(base.InferManager):
             self.wsi_mask = cv2.cvtColor(self.wsi_mask, cv2.COLOR_BGR2GRAY)
             self.wsi_mask[self.wsi_mask > 0] = 1
 
-        elif self.save_mask or self.save_thumb:
+        else:
             log_info(
                 "WARNING: No mask found, generating mask via thresholding at 1.25x!"
             )
@@ -723,8 +717,12 @@ class InferManagerDask(base.InferManager):
                                               patch_output_shape,
                                               num_patches)]
 
-        scaled_patch_shape = [int(math.ceil(p * scaled_wsi_mag / self.wsi_handler.metadata["base_mag"]))
+        scaled_patch_shape = [int(math.ceil(p * scaled_wsi_mag
+                                            / self.wsi_handler.metadata["base_mag"]))
                               for p in self.patch_output_shape]
+        scaled_tile_shape = [int(math.ceil(p * scaled_wsi_mag
+                                           / self.wsi_handler.metadata["base_mag"]))
+                             for p in tile_shape]
 
         paddings = [(0, 0), (0, 0), (0, 0)]
         paddings += [(0, n_p * p - s)
@@ -739,9 +737,10 @@ class InferManagerDask(base.InferManager):
 
         pred_z_wsi = padded_z_wsi.map_overlap(
             _infer_patch,
-            mask=self.wsi_mask,
             net=self.run_step,
+            mask=self.wsi_mask,
             scaled_patch_shape=scaled_patch_shape,
+            offset=2 * offset,
             num_patches=num_patches,
             nr_types=self.nr_types,
             available_gpus_ids=self.available_gpus_ids,
@@ -756,30 +755,30 @@ class InferManagerDask(base.InferManager):
 
         pred_z_wsi = pred_z_wsi.rechunk((tile_shape[0], tile_shape[1], 4))
 
-        post_np_z_wsi = pred_z_wsi.map_blocks(
-            _proc_np_hv,
-            nr_types=self.nr_types,
-            dtype=np.float32,
-            chunks=(*tile_shape, 3 if self.nr_types is None else 4),
-            meta=np.empty((0), dtype=np.float32)
-        )
-
-        post_z_wsi = post_np_z_wsi.map_blocks(
+        post_z_wsi = pred_z_wsi.map_blocks(
             _post_process,
+            mask=self.wsi_mask,
+            scaled_patch_shape=scaled_patch_shape,
             nr_types=self.nr_types,
             offset=(0, 0),
             tile_shape=tile_shape,
             num_tiles=num_tiles,
             check_sides_first=False,
             ambiguous_size=ambiguous_size,
+            merge_edges=True,
             dtype=np.object,
             drop_axis=2,
             chunks=(1, 1),
             meta=np.empty((0), dtype=np.object)
         )
 
+        with ProgressBar():
+            post_z_wsi = post_z_wsi.compute()
+
+        post_z_wsi = da.from_array(post_z_wsi, chunks=(1, 1))
+
         # Fix cells detected at chunk boundaries
-        dict_ver_bounds = post_z_wsi.map_overlap(
+        dict_ver_fix = post_z_wsi.map_overlap(
             _fix_ver_boundaries,
             nr_types=self.nr_types,                        
             num_tiles=num_tiles,
@@ -791,7 +790,11 @@ class InferManagerDask(base.InferManager):
             meta=np.empty((0), dtype=np.object)
         )
 
-        dict_pred_z_wsi = dict_ver_bounds.map_overlap(
+        with ProgressBar():
+            dict_ver_fix = dict_ver_fix.compute()
+
+        dict_ver_fix = da.from_array(dict_ver_fix, chunks=(1, 1))
+        dict_hor_fix = dict_ver_fix.map_overlap(
             _fix_hor_boundaries,
             nr_types=self.nr_types,
             depth=((0, 0), (0, 1)),
@@ -801,28 +804,27 @@ class InferManagerDask(base.InferManager):
             meta=np.empty((0), dtype=np.object)
         )
 
-        with ProgressBar(): #, CacheProfiler() as cprof, ResourceProfiler(dt=2) as rprof, Profiler() as prof:
-            dicts = dict_pred_z_wsi.compute()
+        with ProgressBar():
+            dicts = dict_hor_fix.compute()
 
-        # profilers = [cprof, rprof, prof]
-        # visualize(profilers, filename=os.path.join(output_dir, 'profile_hor.html'), show=False, save=True)
-
+        start = time.perf_counter()
         self.wsi_inst_info = reduce(lambda d1, d2: {**d1, **d2['inner']},
                                     list(dicts.flatten()),
                                     {})
 
         all_keys = list(self.wsi_inst_info.keys())
         for i, k in enumerate(all_keys):
-            # self.wsi_inst_info[i+1] = self.wsi_inst_info.pop(k)
-            if 'pred_map' in self.wsi_inst_info[k]:
-                del(self.wsi_inst_info[k]['pred_map'])
+            self.wsi_inst_info[i+1] = self.wsi_inst_info.pop(k)
+            if 'pred_map' in self.wsi_inst_info[i+1]:
+                del(self.wsi_inst_info[i+1]['pred_map'])
 
         # ! cant possibly save the inst map at high res, too large
-        start = time.perf_counter()
+
         if self.save_mask or self.save_thumb:
             json_path = "%s/json/%s.json" % (output_dir, wsi_name)
         else:
             json_path = "%s/%s.json" % (output_dir, wsi_name)
+
         self._save_json(json_path, self.wsi_inst_info, mag=self.proc_mag)
         end = time.perf_counter()
         log_info("Save Time: {0}".format(end - start))
