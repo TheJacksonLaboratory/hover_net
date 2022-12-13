@@ -58,17 +58,6 @@ class InferManager(object):
         associated run steps to process each data batch.
 
         """
-        model_desc = import_module("models._autoencoders")
-        synthesizer_class = getattr(model_desc, "Synthesizer")
-        if self.method["rec_model_path"] is not None:
-            saved_state_dict = torch.load(self.method["rec_model_path"], map_location='cpu')
-            self.method["model_args"]["net_channels"] = saved_state_dict["args"]["channels_net"]
-            rec_model = synthesizer_class(**saved_state_dict["args"])
-            rec_model.load_state_dict(saved_state_dict["decoder"])
-            rec_model = torch.nn.DataParallel(rec_model)
-            rec_model.eval()
-            self.method["model_args"]["rec_model"] = rec_model
-
         model_desc = import_module("models.hovernet.net_desc")
         model_creator = getattr(model_desc, "create_model")
 

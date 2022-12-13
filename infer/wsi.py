@@ -1,23 +1,17 @@
 import glob
 import json
-import logging
 import math
 import os
 import pathlib
-import shutil
 import time
 from functools import reduce
-from itertools import chain, product
+from itertools import chain
 from collections import OrderedDict
 
 import cv2
 import numpy as np
-import zarr
-from numcodecs import Blosc
-
-import dask
 import dask.array as da
-from dask.diagnostics import ProgressBar, CacheProfiler, ResourceProfiler, Profiler, visualize
+from dask.diagnostics import ProgressBar
 
 from scipy.ndimage import binary_fill_holes
 from skimage import morphology, segmentation
@@ -632,8 +626,8 @@ class InferManagerDask(base.InferManager):
         """Parse command line arguments and set as instance variables."""
         for variable, value in run_args.items():
             self.__setattr__(variable, value)
+
         # to tuple
-        self.chunk_shape = [self.chunk_shape, self.chunk_shape]
         self.tile_shape = [self.tile_shape, self.tile_shape]
         self.patch_input_shape = [self.patch_input_shape, self.patch_input_shape]
         self.patch_output_shape = [self.patch_output_shape, self.patch_output_shape]
@@ -758,7 +752,7 @@ class InferManagerDask(base.InferManager):
         post_z_wsi = pred_z_wsi.map_blocks(
             _post_process,
             mask=self.wsi_mask,
-            scaled_patch_shape=scaled_patch_shape,
+            scaled_patch_shape=scaled_tile_shape,
             nr_types=self.nr_types,
             offset=(0, 0),
             tile_shape=tile_shape,
@@ -863,6 +857,7 @@ class InferManagerDask(base.InferManager):
                 log_info("Skip: %s" % wsi_base_name)
                 continue
 
+            log_info("Processing file %s" % wsi_base_name)
             self.process_single_file(wsi_path, msk_path, self.output_dir)
 
         if self.cache_path != self.output_dir:

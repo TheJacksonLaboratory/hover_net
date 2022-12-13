@@ -12,3 +12,8 @@ logs/
 *.png
 *.log
 .vscode/launch.json
+*.slurm
+*.def
+docker-compose*.yml
+.dockerignore
+*.tar

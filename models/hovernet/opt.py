@@ -17,7 +17,6 @@ from run_utils.engine import Events
 from .targets import gen_targets, prep_sample
 from .net_desc import create_model
 from .run_desc import proc_valid_step_output, train_step, valid_step, viz_step_output
-from .._autoencoders import Synthesizer
 
 
 # TODO: training config only ?

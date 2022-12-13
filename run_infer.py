@@ -15,40 +15,15 @@ Options:
                               and expected overlaid color. [default: '']
 
   --model_path=<path>         Path to saved checkpoint.
-  --rec_model_path=<path>     Path to saved reconstruction model checkpoint.
-  --compressed_input          Is the input compressed? [default: False]
   --data_group=<s>            Group path in the zarr file to use as source data [default: 0]
   --model_mode=<mode>         Original HoVer-Net or the reduced version used PanNuke and MoNuSAC,
                               'original' or 'fast'. [default: fast]
-  --nr_inference_workers=<n>  Number of workers during inference. [default: 8]
-  --nr_post_proc_workers=<n>  Number of workers during post-processing. [default: 16]
-  --batch_size=<n>            Batch size per 1 GPU. [default: 32]
-  --patch_input_size=<n>      Size of the patches feed to the neural network. [default: 256]
+  --patch_input_size=<n>      Size of the patches feed to the neural network. [default: 1280]
 
-Two command mode are `tile` and `wsi` to enter corresponding inference mode
-    tile  run the inference on tile
+Only `wsi` mode is supported by this dask-based implementation
     wsi   run the inference on wsi
 
 Use `run_infer.py <command> --help` to show their options and usage.
-"""
-
-tile_cli = """
-Arguments for processing tiles.
-
-usage:
-    tile (--input_dir=<path>) (--output_dir=<path>) \
-         [--draw_dot] [--save_qupath] [--save_raw_map] [--mem_usage=<n>]
-    
-options:
-   --input_dir=<path>     Path to input data directory. Assumes the files are not nested within directory.
-   --output_dir=<path>    Path to output directory..
-
-   --mem_usage=<n>        Declare how much memory (physical + swap) should be used for caching. 
-                          By default it will load as many tiles as possible till reaching the 
-                          declared limit. [default: 0.2]
-   --draw_dot             To draw nuclei centroid on overlay. [default: False]
-   --save_qupath          To optionally output QuPath v0.2.3 compatible format. [default: False]
-   --save_raw_map         To save raw prediction or not. [default: False]
 """
 
 wsi_cli = """
@@ -57,8 +32,8 @@ Arguments for processing wsi
 usage:
     wsi (--input_dir=<path>) (--output_dir=<path>) [--proc_mag=<n>]\
         [--cache_path=<path>] [--input_mask_dir=<path>] \
-        [--ambiguous_size=<n>] [--chunk_shape=<n>] [--tile_shape=<n>] \
-        [--save_thumb] [--save_mask] [--keep_maps]
+        [--ambiguous_size=<n>] [--tile_shape=<n>] \
+        [--save_thumb] [--save_mask]
     
 options:
     --input_dir=<path>      Path to input data directory. Assumes the files are not nested within directory.
@@ -69,24 +44,22 @@ options:
 
     --proc_mag=<n>          Magnification level (objective power) used for WSI processing. [default: 40]
     --ambiguous_size=<int>  Define ambiguous region along tiling grid to perform re-post processing. [default: 128]
-    --chunk_shape=<n>       Shape of chunk for processing. [default: 10000]
     --tile_shape=<n>        Shape of tiles for processing. [default: 2048]
     --save_thumb            To save thumb. [default: False]
     --save_mask             To save mask. [default: False]
-    --keep_maps             To keep the prediction maps or not. [default: False]
 """
 
 import torch
 import logging
 import os
-import copy
 from misc.utils import log_info
 from docopt import docopt
+from infer.wsi import InferManagerDask
 
 #-------------------------------------------------------------------------------------------------------
 
 if __name__ == '__main__':
-    sub_cli_dict = {'tile' : tile_cli, 'wsi' : wsi_cli}
+    sub_cli_dict = {'wsi' : wsi_cli}
     args = docopt(__doc__, help=False, options_first=True, 
                     version='HoVer-Net Pytorch Inference v1.0')
     sub_cmd = args.pop('<command>')
@@ -134,8 +107,6 @@ if __name__ == '__main__':
                 'mode'       : args['model_mode'],
             },
             'model_path' : args['model_path'],
-            'rec_model_path' : args['rec_model_path'],
-            'compressed_input' : args['compressed_input'],
             'data_group' : args['data_group'],
         },
         'type_info_path'  : None if args['type_info_path'] == '' \
@@ -143,29 +114,14 @@ if __name__ == '__main__':
     }
 
     # ***
-    run_args = {
-        'batch_size' : int(args['batch_size']) * max(nr_gpus, 1),
-        'nr_inference_workers' : int(args['nr_inference_workers']),
-        'nr_post_proc_workers' : int(args['nr_post_proc_workers']),
-    }
+    run_args = {}
 
     if args['model_mode'] in ['fast', 'compressed_rec']:
-        run_args['patch_input_shape'] = int(args['patch_input_size']) # 256
-        run_args['patch_output_shape'] = int(args['patch_input_size']) - 92 # 164
+        run_args['patch_input_shape'] = int(args['patch_input_size'])
+        run_args['patch_output_shape'] = int(args['patch_input_size']) - 92
     else:
         run_args['patch_input_shape'] = 270
         run_args['patch_output_shape'] = 80
-
-    if sub_cmd == 'tile':
-        run_args.update({
-            'input_dir'      : sub_args['input_dir'],
-            'output_dir'     : sub_args['output_dir'],
-
-            'mem_usage'   : float(sub_args['mem_usage']),
-            'draw_dot'    : sub_args['draw_dot'],
-            'save_qupath' : sub_args['save_qupath'],
-            'save_raw_map': sub_args['save_raw_map'],
-        })
 
     if sub_cmd == 'wsi':
         run_args.update({
@@ -176,21 +132,13 @@ if __name__ == '__main__':
 
             'proc_mag'       : int(sub_args['proc_mag']),
             'ambiguous_size' : int(sub_args['ambiguous_size']),
-            'chunk_shape'    : int(sub_args['chunk_shape']),
             'tile_shape'     : int(sub_args['tile_shape']),
             'save_thumb'     : sub_args['save_thumb'],
             'save_mask'      : sub_args['save_mask'],
-            'keep_maps'      : sub_args['keep_maps'],
         })
     # ***
 
-    if sub_cmd == 'tile':
-        from infer.tile import InferManager
-        infer = InferManager(**method_args)
-        infer.process_file_list(run_args)
-    else:
-        from infer.wsi import InferManagerDask
-        infer = InferManagerDask(**method_args)
-        # from infer.wsi import InferManager
-        # infer = InferManager(**method_args)
-        infer.process_wsi_list(run_args)
+    infer = InferManagerDask(**method_args)
+    # from infer.wsi import InferManager
+    # infer = InferManager(**method_args)
+    infer.process_wsi_list(run_args)

@@ -6,8 +6,6 @@ import torch
 import numpy as np
 
 from dataset import get_dataset
-from models import Synthesizer
-
 
 class Config(object):
     """Configuration file."""
@@ -66,14 +64,6 @@ class Config(object):
             raise Exception("Must use either `original`, `fast`, or `compressed_rec` as model mode")
 
         rec_model = None
-        if self.rec_model_path is not None:
-            saved_state_dict = torch.load(self.rec_model_path, map_location='cpu')
-            rec_model = Synthesizer(**saved_state_dict["args"])
-            rec_model.load_state_dict(saved_state_dict["decoder"])
-            rec_model = torch.nn.DataParallel(rec_model)
-            if torch.cuda.is_available():
-                rec_model.cuda()
-            rec_model.eval()
 
         module = importlib.import_module(
             "models.%s.opt" % self.model_name

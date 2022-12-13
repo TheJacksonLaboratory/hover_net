@@ -149,26 +149,16 @@ Options:
   --gpu=<id>                  GPU list. [default: 0]
   --nr_types=<n>              Number of nuclei types to predict. [default: 0]
   --type_info_path=<path>     Path to a json define mapping between type id, type name, 
-                              and expected overlay color. [default: '']
+                              and expected overlaid color. [default: '']
 
   --model_path=<path>         Path to saved checkpoint.
-  --model_mode=<mode>         Original HoVer-Net or the reduced version used in PanNuke / MoNuSAC, 'original' or 'fast'. [default: fast]
-  --nr_inference_workers=<n>  Number of workers during inference. [default: 8]
-  --nr_post_proc_workers=<n>  Number of workers during post-processing. [default: 16]
-  --batch_size=<n>            Batch size. [default: 128]
+  --data_group=<s>            Group path in the zarr file to use as source data [default: 0]
+  --model_mode=<mode>         Original HoVer-Net or the reduced version used PanNuke and MoNuSAC,
+                              'original' or 'fast'. [default: fast]
+  --patch_input_size=<n>      Size of the patches feed to the neural network. [default: 1280]
 ```
 
-Tile Processing Options: <br />
-```
-   --input_dir=<path>     Path to input data directory. Assumes the files are not nested within directory.
-   --output_dir=<path>    Path to output directory..
-
-   --draw_dot             To draw nuclei centroid on overlay. [default: False]
-   --save_qupath          To optionally output QuPath v0.2.3 compatible format. [default: False]
-   --save_raw_map         To save raw prediction or not. [default: False]
-```
-
-WSI Processing Options: <br />
+WSI Processing Options (only WSI is supported by the dask-based version): <br />
 ```
     --input_dir=<path>      Path to input data directory. Assumes the files are not nested within directory.
     --output_dir=<path>     Path to output directory.
@@ -178,7 +168,6 @@ WSI Processing Options: <br />
 
     --proc_mag=<n>          Magnification level (objective power) used for WSI processing. [default: 40]
     --ambiguous_size=<int>  Define ambiguous region along tiling grid to perform re-post processing. [default: 128]
-    --chunk_shape=<n>       Shape of chunk for processing. [default: 10000]
     --tile_shape=<n>        Shape of tiles for processing. [default: 2048]
     --save_thumb            To save thumb. [default: False]
     --save_mask             To save mask. [default: False]
