@@ -832,9 +832,6 @@ class InferManagerDask(base.InferManager):
         """
         self._parse_args(run_args)
 
-        if not os.path.exists(self.cache_path):
-            rm_n_mkdir(self.cache_path)
-
         if not os.path.exists(self.output_dir + "/json/"):
             rm_n_mkdir(self.output_dir + "/json/")
         if self.save_thumb:
@@ -859,8 +856,5 @@ class InferManagerDask(base.InferManager):
 
             log_info("Processing file %s" % wsi_base_name)
             self.process_single_file(wsi_path, msk_path, self.output_dir)
-
-        if self.cache_path != self.output_dir:
-            rm_n_mkdir(self.cache_path)  # clean up all cache
 
         return
