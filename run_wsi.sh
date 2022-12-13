@@ -1,33 +1,15 @@
 #!/bin/bash
 
-# Usage: bash run_wsi.sh < input dir holding one or more WSIs > < output dir > < image magnification level (20, 40) > <model type (pannuke, monusac) [default: pannuke] >
+# Usage: bash run_wsi.sh [-m model type (pannuke, monusac) -p pach size -t tile size -a ambiguous size] < input dir holding one or more WSIs > < output dir > < image magnification level (20, 40) >
 # For example:
 # bash run_wsi.sh /mnt/data/zarr /mnt/data/result/ 40
-
-SRC_DIR=$1
-DST_DIR=$2
-PROC_MAG=$3
-
-if [ "$SRC_DIR" == "" ]; then
-    echo "Source directory containing at least one WSI image is needed"
-    exit 1
-fi
-
-if [ "$DST_DIR" == "" ]; then
-    echo "Destination directory where to store the inference output is needed"
-    exit 1
-fi
-
-if [ "$PROC_MAG" == "" ]; then
-    PROC_MAG=40
-fi
 
 AMB_SIZE=""
 TILE_SHAPE=""
 PATCH_SIZE=""
 MODEL_TYPE=""
 
-while getopts ":m:p:t:a:" opt; do
+while getopts ":h:m:p:t:a:" opt; do
   case $opt in
     a)
       AMB_SIZE=$OPTARG
@@ -40,6 +22,13 @@ while getopts ":m:p:t:a:" opt; do
       ;;
     m)
       MODEL_TYPE=$OPTARG
+      ;;
+    h)
+      echo "Usage: bash run_wsi.sh [-m model type (pannuke, monusac) -p pach size -t tile size -a ambiguous size] < input dir holding one or more WSIs > < output dir > < image magnification level (20, 40) >"
+      echo "For example:"
+      echo "bash run_wsi.sh /mnt/data/zarr /mnt/data/result/ 40"
+      echo " Executes HoVer-Net inference and post-processing using the 'pannuke' pretrained model"
+      exit 0
       ;;
     \?)
       echo "Invalid option: -$OPTARG" >&2
@@ -79,6 +68,24 @@ elif [ "$MODEL_TYPE" == "monusac" ]; then
 else
     echo "Model ${MODEL_TYPE} not supported."
     exit 1
+fi
+
+SRC_DIR=${@:$OPTIND:1}
+DST_DIR=${@:$OPTIND+1:1}
+PROC_MAG=${@:$OPTIND+2:1}
+
+if [ "$SRC_DIR" == "" ]; then
+    echo "Source directory containing at least one WSI image is needed"
+    exit 1
+fi
+
+if [ "$DST_DIR" == "" ]; then
+    echo "Destination directory where to store the inference output is needed"
+    exit 1
+fi
+
+if [ "$PROC_MAG" == "" ]; then
+    PROC_MAG=40
 fi
 
 # If the destination directory does not exist, create it
