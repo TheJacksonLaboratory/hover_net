@@ -55,7 +55,7 @@ class FileHandler(object):
         # may off some pixels wrt existing mag
         return (self.metadata["base_shape"] * scale).astype(np.int32)
 
-    def prepare_reading(self, read_mag=None, read_mpp=None, cache_path=None):
+    def prepare_reading(self, read_mag=None, read_mpp=None):
         """Only use `read_mag` or `read_mpp`, not both, prioritize `read_mpp`.
 
         `read_mpp` is in X, Y format.
@@ -67,9 +67,7 @@ class FileHandler(object):
         if scale_factor is None:
             self.image_ptr = None
             self.read_lv = read_lv
-        else:
-            np.save(cache_path, self.get_full_img(read_mag=read_mag))
-            self.image_ptr = np.load(cache_path, mmap_mode="r")
+
         return
 
     def _get_read_info(self, read_mag=None, read_mpp=None):
@@ -241,7 +239,7 @@ class ZarrHandler(FileHandler):
         ]
         return OrderedDict(metadata)
 
-    def prepare_reading(self, read_mag=None, read_mpp=None, cache_path=None):
+    def prepare_reading(self, read_mag=None, read_mpp=None):
         """Only use `read_mag` or `read_mpp`, not both, prioritize `read_mpp`.
 
         `read_mpp` is in X, Y format.
