@@ -120,7 +120,7 @@ if __name__ == '__main__':
         level=logging.INFO,
         format='|%(asctime)s.%(msecs)03d| [%(levelname)s] %(message)s',datefmt='%Y-%m-%d|%H:%M:%S',
         handlers=[
-            logging.FileHandler(os.path.join(sub_args['log_path'], "debug.log")),
+            logging.FileHandler(os.path.join(args['log_path'], "debug.log")),
             logging.StreamHandler()
         ]
     )
