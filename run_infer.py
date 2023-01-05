@@ -37,7 +37,7 @@ Arguments for processing tiles.
 
 usage:
     tile (--input_dir=<path>) (--output_dir=<path>) \
-         [--draw_dot] [--save_qupath] [--save_raw_map] [--mem_usage=<n>]
+         [--log_path] [--draw_dot] [--save_qupath] [--save_raw_map] [--mem_usage=<n>]
     
 options:
    --input_dir=<path>     Path to input data directory. Assumes the files are not nested within directory.
