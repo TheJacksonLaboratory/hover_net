@@ -24,6 +24,7 @@ Options:
   --nr_post_proc_workers=<n>  Number of workers during post-processing. [default: 16]
   --batch_size=<n>            Batch size per 1 GPU. [default: 32]
   --patch_input_size=<n>      Size of the patches feed to the neural network. [default: 256]
+  --log_path=<path>           Path for logging. [default: .]
 
 Two command mode are `tile` and `wsi` to enter corresponding inference mode
     tile  run the inference on tile
@@ -37,7 +38,7 @@ Arguments for processing tiles.
 
 usage:
     tile (--input_dir=<path>) (--output_dir=<path>) \
-         [--log_path] [--draw_dot] [--save_qupath] [--save_raw_map] [--mem_usage=<n>]
+         [--draw_dot] [--save_qupath] [--save_raw_map] [--mem_usage=<n>]
     
 options:
    --input_dir=<path>     Path to input data directory. Assumes the files are not nested within directory.
@@ -46,7 +47,6 @@ options:
    --mem_usage=<n>        Declare how much memory (physical + swap) should be used for caching. 
                           By default it will load as many tiles as possible till reaching the 
                           declared limit. [default: 0.2]
-   --log_path=<path>      Path for logging. [default: .]
    --draw_dot             To draw nuclei centroid on overlay. [default: False]
    --save_qupath          To optionally output QuPath v0.2.3 compatible format. [default: False]
    --save_raw_map         To save raw prediction or not. [default: False]
