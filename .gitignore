@@ -12,3 +12,7 @@ logs/
 *.png
 *.log
 .vscode/launch.json
+*.tar
+*.yml
+*.def
+*.slurm

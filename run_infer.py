@@ -46,6 +46,7 @@ options:
    --mem_usage=<n>        Declare how much memory (physical + swap) should be used for caching. 
                           By default it will load as many tiles as possible till reaching the 
                           declared limit. [default: 0.2]
+   --log_path=<path>      Path for logging. [default: .]
    --draw_dot             To draw nuclei centroid on overlay. [default: False]
    --save_qupath          To optionally output QuPath v0.2.3 compatible format. [default: False]
    --save_raw_map         To save raw prediction or not. [default: False]
@@ -92,16 +93,6 @@ if __name__ == '__main__':
     sub_cmd = args.pop('<command>')
     sub_cmd_args = args.pop('<args>')
 
-    # ! TODO: where to save logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='|%(asctime)s.%(msecs)03d| [%(levelname)s] %(message)s',datefmt='%Y-%m-%d|%H:%M:%S',
-        handlers=[
-            logging.FileHandler("debug.log"),
-            logging.StreamHandler()
-        ]
-    )
-
     if args['--help'] and sub_cmd is not None:
         if sub_cmd in sub_cli_dict: 
             print(sub_cli_dict[sub_cmd])
@@ -123,6 +114,17 @@ if __name__ == '__main__':
 
     args = {k.replace('--', '') : v for k, v in args.items()}
     sub_args = {k.replace('--', '') : v for k, v in sub_args.items()}
+
+    # ! TODO: where to save logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='|%(asctime)s.%(msecs)03d| [%(levelname)s] %(message)s',datefmt='%Y-%m-%d|%H:%M:%S',
+        handlers=[
+            logging.FileHandler(os.path.join(sub_args['log_path'], "debug.log")),
+            logging.StreamHandler()
+        ]
+    )
+
     if args['model_path'] == None:
         raise Exception('A model path must be supplied as an argument with --model_path.')
 
